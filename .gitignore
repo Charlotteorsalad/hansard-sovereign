@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/
+*.egg-info/
+
+# Python build and cache artifacts
+*.pyc
+.ruff_cache/
+
+# IDE settings
+.vscode/
