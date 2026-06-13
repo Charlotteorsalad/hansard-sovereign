@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pdfplumber
@@ -70,18 +71,32 @@ def extract_speeches(pdf_path: Path) -> list[dict]:
     with pdfplumber.open(pdf_path) as pdf:
         for i in range(start_page, len(pdf.pages)):
             text = pdf.pages[i].extract_text() or ""
-            lines = text.split("\n")
-            for line in lines:
-                if "]:" in line:
-                    split = line.split("]:", 1)
-                    speaker_raw = split[0] + "]"
-                    content = split[1].strip()
-                    results.append(
-                        {
-                            "type": "speech",
-                            "speaker_raw": speaker_raw,
-                            "content": content,
-                            "page": i + 1,
-                        }
-                    )
+            parts = text.split("]:")
+            for part in parts[1:]:
+                last_bracket = part.rfind("[")
+                if last_bracket == -1:
+                    continue
+                matches = list(re.finditer(r"\.\s*\n", part[:last_bracket]))
+                if matches:
+                    cut = matches[-1].end()
+                else:
+                    cut = part.rfind("\n", 0, last_bracket) + 1
+                last_newline_after_cut = part.rfind("\n", cut, last_bracket)
+                if last_newline_after_cut != -1:
+                    cut = last_newline_after_cut + 1
+                speaker_raw = (
+                    part[cut:last_bracket].strip()
+                    + " "
+                    + part[last_bracket:].strip()
+                    + "]"
+                )
+                content = part[:cut].strip()
+                results.append(
+                    {
+                        "type": "speech",
+                        "speaker_raw": speaker_raw,
+                        "content": content,
+                        "page": i + 1,
+                    }
+                )
     return results

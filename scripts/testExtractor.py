@@ -28,5 +28,6 @@ from myhansard.extractor import extract_speeches
 #     print(r)
 #     print()
 
-results = extract_speeches(Path("data/raw/04032024.pdf"))
-print(f"Total speeches: {len(results)}")
+for pdf_file in sorted(Path("data/raw").glob("*.pdf")):
+    results = extract_speeches(pdf_file)
+    print(f"{pdf_file.name}: {len(results)} speeches")
