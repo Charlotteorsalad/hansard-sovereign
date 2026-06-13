@@ -1,4 +1,12 @@
 from .downloader import download_by_date as downloadurl
-from .extractor import find_content_start, peek
+from .extractor import extract_speeches, find_content_start, peek
+from .storage import init_db, insert_speeches
 
-__all__ = ["downloadurl", "peek", "find_content_start"]
+__all__ = [
+    "downloadurl",
+    "peek",
+    "find_content_start",
+    "extract_speeches",
+    "init_db",
+    "insert_speeches",
+]
