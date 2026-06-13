@@ -23,6 +23,14 @@ def init_db(db_path: Path):
     conn.close()
 
 
+def date_exists(conn: sqlite3.Connection, date: str) -> bool:
+    """Check if speeches for a given date already exist in the database."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM speeches WHERE date = ?", (date,))
+    count = cursor.fetchone()[0]
+    return count > 0
+
+
 def insert_speeches(
     conn: sqlite3.Connection, speeches: list[dict], date: str, source_file: str
 ) -> None:
