@@ -28,7 +28,8 @@ def embed_speeches(conn, collection, model_name: str = "BAAI/bge-m3"):
         ids=[str(r[0]) for r in rows],
         embeddings=[e.tolist() for e in embeddings],
         metadatas=[
-            {"speaker_raw": r[1], "date": r[3], "source_file": r[4]} for r in rows
+            {"id": r[0], "speaker_raw": r[1], "date": r[3], "source_file": r[4]}
+            for r in rows
         ],
     )
 
