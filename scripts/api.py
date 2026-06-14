@@ -3,10 +3,18 @@ from pathlib import Path
 
 import myhansard
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from myhansard.rag import answer
 from pydantic import BaseModel
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DB_PATH = Path("data/hansard.db")
 CHROMA_PATH = Path("data/chroma")
