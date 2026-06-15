@@ -5,6 +5,7 @@ import { useState, useRef, useEffect } from "react";
 interface Source {
   speaker: string;
   date: string;
+  content?:string;
 }
 
 interface Message {
@@ -33,10 +34,14 @@ function SourceCard({ source }: { source: Source }) {
       <p className="font-medium text-gray-800">{name}</p>
       {constituency && <p className="text-gray-500 text-xs">{constituency}</p>}
       <p className="text-blue-500 text-xs mt-1">{source.date}</p>
+      {source.content && (
+        <p className="text-gray-600 text-xs mt-2 line-clamp-3">
+          {source.content.slice(0, 150)}...
+        </p>
+      )}
     </div>
   );
 }
-
 function LoadingDots() {
   return (
     <div className="flex gap-1 items-center p-4">

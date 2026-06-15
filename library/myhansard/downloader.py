@@ -104,3 +104,14 @@ def download_by_date(start: str, end: str | None = None) -> dict:
         "failed": failed_count,
         "failed_dates": failed_dates if failed_dates else None,
     }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end")
+    args = parser.parse_args()
+    result = download_by_date(args.start, args.end)
+    print(result)
