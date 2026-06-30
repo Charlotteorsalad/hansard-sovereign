@@ -8,13 +8,9 @@ RAW_DIR = Path("data/raw")
 
 
 def main():
-    # Initialize the database
     myhansard.init_db(DB_PATH)
-
-    # Connect to the database
     conn = sqlite3.connect(DB_PATH)
 
-    # Process each raw file
     for hansard_raw in RAW_DIR.glob("*.pdf"):
         print(f"Processing {hansard_raw}...")
         date = (
@@ -29,7 +25,6 @@ def main():
             continue
         speeches = myhansard.extract_speeches(hansard_raw)
         myhansard.insert_speeches(conn, speeches, date, str(hansard_raw))
-    # Close the database connection
     conn.close()
 
 

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <rect width="32" height="32" rx="8" fill="#2563EB"/>
+  <!-- dome -->
+  <path d="M16 5 C10 5 7 10 7 14 L25 14 C25 10 22 5 16 5 Z" fill="white"/>
+  <!-- spire -->
+  <rect x="15" y="2" width="2" height="4" rx="1" fill="white"/>
+  <!-- columns -->
+  <rect x="8"  y="14" width="2" height="10" rx="1" fill="white"/>
+  <rect x="11.5" y="14" width="2" height="10" rx="1" fill="white"/>
+  <rect x="15" y="14" width="2" height="10" rx="1" fill="white"/>
+  <rect x="18.5" y="14" width="2" height="10" rx="1" fill="white"/>
+  <rect x="22" y="14" width="2" height="10" rx="1" fill="white"/>
+  <!-- base -->
+  <rect x="6" y="24" width="20" height="3" rx="1" fill="white"/>
+  <rect x="4" y="27" width="24" height="2" rx="1" fill="white"/>
+</svg>

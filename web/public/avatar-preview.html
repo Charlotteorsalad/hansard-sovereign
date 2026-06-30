@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Avatar 加载动画预览</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    background: #f8fafc;
+    font-family: system-ui, sans-serif;
+    color: #334155;
+  }
+  .row { display: flex; align-items: center; gap: 14px; }
+  .avatar {
+    flex-shrink: 0;
+    width: 32px; height: 32px;
+    border-radius: 9999px;
+    background: #2563eb;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 1px 2px rgba(0,0,0,.08);
+  }
+  .avatar svg { width: 16px; height: 16px; color: #fff; }
+  .dots { display: flex; gap: 6px; }
+  .dots i {
+    width: 6px; height: 6px; border-radius: 9999px; background: #cbd5e1;
+    display: inline-block; animation: bounce 1s infinite;
+  }
+  .dots i:nth-child(1) { animation-delay: -.3s; }
+  .dots i:nth-child(2) { animation-delay: -.15s; }
+  @keyframes bounce { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
+
+  /* === 与 globals.css 中相同的动画 === */
+  .avatar-thinking { position: relative; animation: avatar-breathe 1.4s ease-in-out infinite; }
+  .avatar-thinking::after {
+    content: ""; position: absolute; inset: 0; border-radius: 9999px;
+    background: rgb(37,99,235); animation: avatar-ping 1.4s cubic-bezier(0,0,.2,1) infinite;
+  }
+  .avatar-thinking > svg { position: relative; z-index: 1; animation: avatar-icon-pulse 1.4s ease-in-out infinite; }
+  @keyframes avatar-breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(1.12)} }
+  @keyframes avatar-ping { 0%{transform:scale(1);opacity:.55} 75%,100%{transform:scale(1.9);opacity:0} }
+  @keyframes avatar-icon-pulse { 0%,100%{opacity:.65} 50%{opacity:1} }
+</style>
+</head>
+<body>
+  <p>下方是「生成中」时 AI 头像的效果（脉冲光环 + 呼吸缩放 + 图标明暗）：</p>
+  <div class="row">
+    <div class="avatar avatar-thinking">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" x2="21" y1="22" y2="22"/><line x1="6" x2="6" y1="18" y2="11"/><line x1="10" x2="10" y1="18" y2="11"/><line x1="14" x2="14" y1="18" y2="11"/><line x1="18" x2="18" y1="18" y2="11"/><polygon points="12 2 20 7 4 7"/></svg>
+    </div>
+    <div class="dots"><i></i><i></i><i></i></div>
+    <span style="color:#94a3b8;font-size:14px">思考中…</span>
+  </div>
+
+  <div class="row">
+    <span style="color:#94a3b8;font-size:13px">对比 · 静止头像（生成完成后）：</span>
+    <div class="avatar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" x2="21" y1="22" y2="22"/><line x1="6" x2="6" y1="18" y2="11"/><line x1="10" x2="10" y1="18" y2="11"/><line x1="14" x2="14" y1="18" y2="11"/><line x1="18" x2="18" y1="18" y2="11"/><polygon points="12 2 20 7 4 7"/></svg>
+    </div>
+  </div>
+</body>
+</html>

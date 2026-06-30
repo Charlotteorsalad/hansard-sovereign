@@ -3,9 +3,7 @@ from pathlib import Path
 
 
 def init_db(db_path: Path):
-    """
-    Create the SQLite database and speeches table if not exist.
-    """
+    """Create the SQLite database and speeches table if they don't exist."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("""
@@ -34,9 +32,7 @@ def date_exists(conn: sqlite3.Connection, date: str) -> bool:
 def insert_speeches(
     conn: sqlite3.Connection, speeches: list[dict], date: str, source_file: str
 ) -> None:
-    """
-    Insert a list of speeches into the SQLite database.
-    """
+    """Insert a list of speeches into the database."""
     cursor = conn.cursor()
     data = [
         (s["speaker_raw"], s["content"], s["page"], date, s["type"], source_file)

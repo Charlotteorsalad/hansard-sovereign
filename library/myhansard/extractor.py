@@ -12,18 +12,11 @@ def peek(pdf_path: Path, max_pages: int = 50) -> None:
 
 
 def find_content_start(pdf_path: Path) -> int:
-    """
-    Find the page index where the content (议员发言) starts.
+    """Return the 0-based page index where speeches start.
 
-    Looks for marker 'DOA' (Islamic prayer, Parliament's standard opening ritual).
-
-    KNOWN-WORKING FORMAT: 2024 Parlimen ke-15.
-
-    Returns:
-        0-based page index (e.g. returns 10 if content starts on visual page 11)
-
-    Raises:
-        ValueError: if marker not found anywhere in PDF
+    The first page containing "DOA" (the standard opening prayer) marks the
+    start of debate content. Tested against the 2024 Parlimen ke-15 format.
+    Raises ValueError if the marker is missing.
     """
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -57,25 +50,41 @@ def list_agenda_anchors(pdf_path: Path, max_pages: int = 50) -> None:
 
 
 def extract_speeches(pdf_path: Path) -> list[dict]:
-    """
-    A function to enumerate the document and extract speeches/agendas into a structured
-    format.
+    """Extract speeches from a Hansard PDF.
 
-    Anchor to find speeches: lines containing "]:" (e.g. "YB Dato' Seri Anwar Ibrahim [PKR-PKR]:...")
-    Anchor to find agendas: lines containing "]" (e.g. "1. PENGENALAN YB DATO' SERI ANWAR IBRAHIM [PKR-PKR] meminta...")
+    Splits on "]:" anchors like "Dato' Seri Anwar Ibrahim [Bera]:". Each content
+    block belongs to the speaker named in the previous split, so we hold that
+    name in pending_speaker rather than the one that follows the block.
 
-    Returns: A list dictionaries, with the keys of 'type' (either 'speech' or 'agenda'), 'speaker_raw' (for speeches), 'content', and 'page'.
+    Returns dicts with keys: type, speaker_raw, content, page.
     """
     start_page = find_content_start(pdf_path)
     results = []
+    pending_speaker = None
+
     with pdfplumber.open(pdf_path) as pdf:
         for i in range(start_page, len(pdf.pages)):
             text = pdf.pages[i].extract_text() or ""
             parts = text.split("]:")
-            for part in parts[1:]:
+
+            for part in parts:
                 last_bracket = part.rfind("[")
+
                 if last_bracket == -1:
+                    # No following speaker tag, so the rest is the pending speaker's
+                    if pending_speaker:
+                        content = part.strip()
+                        if len(content) >= 80:
+                            results.append(
+                                {
+                                    "type": "speech",
+                                    "speaker_raw": pending_speaker,
+                                    "content": content,
+                                    "page": i + 1,
+                                }
+                            )
                     continue
+
                 matches = list(re.finditer(r"\.\s*\n", part[:last_bracket]))
                 if matches:
                     cut = matches[-1].end()
@@ -84,19 +93,25 @@ def extract_speeches(pdf_path: Path) -> list[dict]:
                 last_newline_after_cut = part.rfind("\n", cut, last_bracket)
                 if last_newline_after_cut != -1:
                     cut = last_newline_after_cut + 1
-                speaker_raw = (
+
+                content = part[:cut].strip()
+                next_speaker_raw = (
                     part[cut:last_bracket].strip()
                     + " "
                     + part[last_bracket:].strip()
                     + "]"
                 )
-                content = part[:cut].strip()
-                results.append(
-                    {
-                        "type": "speech",
-                        "speaker_raw": speaker_raw,
-                        "content": content,
-                        "page": i + 1,
-                    }
-                )
+
+                if pending_speaker and len(content) >= 80:
+                    results.append(
+                        {
+                            "type": "speech",
+                            "speaker_raw": pending_speaker,
+                            "content": content,
+                            "page": i + 1,
+                        }
+                    )
+
+                pending_speaker = next_speaker_raw
+
     return results

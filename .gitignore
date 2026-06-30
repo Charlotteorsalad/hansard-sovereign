@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 data/
+# keep the UI design reference tables (the CLI in tools/ui-design needs them)
+!tools/ui-design/data/
 *.egg-info/
 
 # Python build and cache artifacts
