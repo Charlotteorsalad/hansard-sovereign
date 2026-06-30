@@ -47,8 +47,7 @@ parlimen.gov.my PDFs
 
 Small local models are unreliable at strict formatting, so anything that must be
 exact — speaker names, citation numbering, output language, intros/conclusions —
-is handled deterministically in Python rather than left to the model. See
-[docs/rag-lessons.md](docs/rag-lessons.md).
+is handled deterministically in Python rather than left to the model.
 
 ## Tech stack
 
@@ -69,7 +68,6 @@ library/myhansard/   downloader, extractor, storage, embedder, rag, bench
 scripts/             data pipeline, API server, benchmarks, dev runners
 web/                 Next.js chat UI and /eval benchmark page
 tools/ui-design/     standalone UI design reference CLI (CSV-backed)
-docs/                RAG lessons and the quantization benchmark write-up
 ```
 
 ## Prerequisites
@@ -131,11 +129,10 @@ The `/eval` page runs the real retrieval + generation path live and streams the
 numbers as they happen — time to first token, tokens/sec, and peak VRAM — and
 can compare every installed Ollama model on the same query.
 
-An offline sweep is in [docs/quantization_benchmark.md](docs/quantization_benchmark.md).
 On a 4 GB RTX A2000 Laptop GPU, the production 8B-q4_K_M model spills ~58% of its
 layers to the CPU and runs at ~5.7 tok/s, while a fully-resident Qwen2.5-1.5B
 reaches ~85 tok/s. The 8B is kept for answer quality, with token streaming to
-hide the latency. Reproduce with:
+hide the latency. An offline sweep can be reproduced with:
 
 ```bash
 uv run python scripts/benchmark_quantization.py
