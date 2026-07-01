@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import re
 import time
@@ -8,6 +9,11 @@ import requests
 from lingua import Language, LanguageDetectorBuilder
 
 import myhansard
+
+# Where Ollama lives. Defaults to localhost; set OLLAMA_BASE_URL to point a
+# containerised backend at Ollama running on the Docker host
+# (e.g. http://host.docker.internal:11434).
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # Built once at import; loading the language models is expensive. English vs Malay only.
 _DETECTOR = (
@@ -387,7 +393,7 @@ def _generate_body(
     fallback = ""
     for _ in range(tries):
         resp = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_BASE_URL}/api/generate",
             json={
                 "model": model,
                 "system": system,
@@ -467,7 +473,7 @@ def stream_answer(
         return None
 
     with requests.post(
-        "http://localhost:11434/api/generate",
+        f"{OLLAMA_BASE_URL}/api/generate",
         json={
             "model": model,
             "system": _build_system(lang),

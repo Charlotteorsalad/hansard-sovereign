@@ -8,6 +8,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if [ ! -f data/hansard.db ]; then
+  echo "⚠ No index found (data/hansard.db missing)."
+  echo "  Get the prebuilt one:  bash scripts/fetch_data.sh"
+  echo "  …or build from scratch: bash scripts/bootstrap.sh"
+  exit 1
+fi
+
 cleanup() {
   kill "$API_PID" 2>/dev/null || true
   # Safety net in case uv/uvicorn outlived its parent.

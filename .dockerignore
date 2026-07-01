@@ -1,0 +1,16 @@
+# Keep the backend build context small. data/ is mounted at runtime, not baked.
+.git
+.venv
+**/__pycache__
+**/*.pyc
+data
+results
+docs
+web
+.claude
+*.md
+!README.md
+.dockerignore
+docker-compose.yml
+Dockerfile
+scratch_bench.*

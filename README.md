@@ -24,6 +24,63 @@ Bahasa Malaysia questions are supported.
 - **Live inference benchmark** — an `/eval` page that streams real TTFT,
   tokens/sec and peak VRAM straight from the local model.
 
+## Quick start
+
+Everything runs on your own machine. You need [`uv`](https://github.com/astral-sh/uv),
+Node.js, and [Ollama](https://ollama.com).
+
+```bash
+# 1. clone + install deps
+git clone https://github.com/Charlotteorsalad/hansard-sovereign.git
+cd hansard-sovereign
+uv sync
+cd web && npm install && cd ..
+
+# 2. pull the LLM (with Ollama running)
+ollama pull llama3.1:8b-instruct-q4_K_M
+
+# 3. grab the prebuilt index — no PDF download or embedding needed
+bash scripts/fetch_data.sh
+
+# 4. run it (API on :8000, web on :3000)
+bash scripts/dev.sh
+```
+
+Open <http://localhost:3000> to chat, or <http://localhost:3000/eval> for the
+live inference benchmark.
+
+Want to build the index from source instead of downloading it? Skip step 3 and
+run `bash scripts/bootstrap.sh` (downloads Hansard PDFs, extracts, and embeds —
+slower, GPU-bound).
+
+<details>
+<summary><b>Maintainer: publishing the prebuilt index</b></summary>
+
+`scripts/fetch_data.sh` downloads a public GitHub Release asset. To (re)publish
+the index after rebuilding it:
+
+```bash
+# 1. pack the runtime data (raw PDFs are not needed)
+tar -czf hansard-data.tar.gz -C data hansard.db chroma
+
+# 2a. publish with the GitHub web UI (no extra tools):
+#     repo → Releases → "Draft a new release"
+#     → tag: data-v1   → attach hansard-data.tar.gz   → Publish
+
+# 2b. …or with the gh CLI:
+gh release create data-v1 hansard-data.tar.gz \
+  -t "Prebuilt index" -n "SQLite + ChromaDB index for one-command setup"
+```
+
+The tag (`data-v1`) and asset name (`hansard-data.tar.gz`) must match
+`scripts/fetch_data.sh`. Publishing a newer index under `data-v2` lets users opt
+in with `DATA_TAG=data-v2 bash scripts/fetch_data.sh`.
+
+</details>
+
+Prefer containers? With Ollama running on the host and `data/` already built,
+`docker compose up --build` brings up the whole app (see [Docker](#docker)).
+
 ## Architecture
 
 ```
@@ -122,6 +179,34 @@ To run the pieces separately:
 bash scripts/serve.sh      # API only (long-lived; start once)
 cd web && npm run dev      # front end only
 ```
+
+## Docker
+
+The whole app ships as two containers (backend + frontend). **Ollama is not
+containerised** — it keeps the GPU and stays on the host, so there's no
+NVIDIA-Container-Toolkit setup; the backend reaches it via
+`host.docker.internal`. The backend itself runs CPU-only (the query embedder is
+CPU; generation is Ollama), so its image needs no GPU.
+
+```bash
+ollama serve                 # on the HOST (must have the models pulled)
+docker compose up --build    # backend :8000 + web :3000
+```
+
+Then open <http://localhost:3000>. The `data/` directory (sqlite + chroma) is
+mounted at runtime — populate it first (see Setup), it isn't baked into the
+image.
+
+Two env vars make the same images work when hosting the pieces apart:
+
+| Variable | Set on | Points to |
+| --- | --- | --- |
+| `BACKEND_URL` | frontend | the FastAPI backend (default `http://localhost:8000`) |
+| `OLLAMA_BASE_URL` | backend | the Ollama server (default `http://localhost:11434`) |
+
+> Note: `/eval`'s live VRAM and GPU/CPU-split figures read `nvidia-smi` and the
+> `ollama` CLI, so they're only populated when the backend runs natively on the
+> GPU host; tokens/sec and TTFT still work from inside a container.
 
 ## Inference benchmark
 

@@ -10,10 +10,16 @@ import time
 
 import requests
 
-from .rag import _build_prompt, _build_system, _detect_lang, _retrieve
+from .rag import (
+    OLLAMA_BASE_URL,
+    _build_prompt,
+    _build_system,
+    _detect_lang,
+    _retrieve,
+)
 
-OLLAMA_GENERATE = "http://localhost:11434/api/generate"
-OLLAMA_TAGS = "http://localhost:11434/api/tags"
+OLLAMA_GENERATE = f"{OLLAMA_BASE_URL}/api/generate"
+OLLAMA_TAGS = f"{OLLAMA_BASE_URL}/api/tags"
 
 # Fixed seed and temperature so we measure the engine, not sampling noise.
 GEN_OPTIONS = {"temperature": 0.3, "seed": 42}

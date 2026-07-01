@@ -9,5 +9,8 @@ data/
 *.pyc
 .ruff_cache/
 
+# Prebuilt-index tarball (published to a GitHub Release, not committed)
+hansard-data.tar.gz
+
 # IDE settings
 .vscode/

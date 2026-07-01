@@ -1,0 +1,35 @@
+# One-command local deploy: backend + frontend.
+#
+#   ollama serve            # on the HOST (keeps the GPU; models stay put)
+#   docker compose up --build
+#   → web  http://localhost:3000   ·   api http://localhost:8000
+#
+# Ollama is intentionally NOT containerised: it owns the GPU, and keeping it on
+# the host avoids NVIDIA-Container-Toolkit setup. The backend reaches it via
+# host.docker.internal. The data/ dir (sqlite + chroma) is mounted, not baked
+# into the image — populate it first with the ingest pipeline.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      CUDA_VISIBLE_DEVICES: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # lets the container reach host Ollama on Linux
+    volumes:
+      - ./data:/app/data # sqlite/chroma need write access for WAL + lock files
+    ports:
+      - "8000:8000"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend

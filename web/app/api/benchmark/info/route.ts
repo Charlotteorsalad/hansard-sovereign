@@ -1,6 +1,8 @@
+import { BACKEND_URL } from "@/lib/backend";
+
 export async function GET() {
   try {
-    const res = await fetch("http://localhost:8000/benchmark/info", {
+    const res = await fetch(`${BACKEND_URL}/benchmark/info`, {
       cache: "no-store",
       // Don't let a slow backend hang the page; fail to "offline" quickly.
       signal: AbortSignal.timeout(4000),

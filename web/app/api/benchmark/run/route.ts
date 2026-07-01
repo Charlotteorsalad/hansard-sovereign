@@ -1,8 +1,9 @@
 import { NextRequest } from "next/server";
+import { BACKEND_URL } from "@/lib/backend";
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const res = await fetch("http://localhost:8000/benchmark/run", {
+  const res = await fetch(`${BACKEND_URL}/benchmark/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
