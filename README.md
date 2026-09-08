@@ -9,6 +9,26 @@ Answers are grounded in the source debates, cite the speaker and constituency,
 and link back to the originating speech with `[n]` citations. Both English and
 Bahasa Malaysia questions are supported.
 
+## Demo
+### Chat(Llama 8B) - English
+<img width="1904" height="962" alt="image" src="https://github.com/user-attachments/assets/fa98a119-237d-401b-bd71-8f75bf968058" />
+
+### Chat(Llama 8B) - Malay
+<img width="1904" height="899" alt="image" src="https://github.com/user-attachments/assets/a0b4faf3-6faa-4bc6-bb30-fe9646ab4e12" />
+
+### Chat(Fine-tuned 1.5B)
+<img width="1914" height="901" alt="image" src="https://github.com/user-attachments/assets/b9a55e88-d116-49a1-b950-b2bbc955bd9c" />
+
+### Compare both Llama 8B and Fine-tuned 1.5B
+<img width="1910" height="900" alt="image" src="https://github.com/user-attachments/assets/4920dfbe-7f99-49c5-981a-82b5d619795b" />
+<img width="1899" height="898" alt="image" src="https://github.com/user-attachments/assets/7c30f349-b5b0-4c3d-83a6-e4b916f7d781" />
+
+### Live inference benchmark - Model comparison
+to be update
+
+### Live inference benchmark - Context length
+to be update
+
 ## Features
 
 - **End-to-end local pipeline** — download → extract → store → embed → serve,
