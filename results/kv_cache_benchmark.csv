@@ -1,0 +1,7 @@
+kv_cache_type,model,num_ctx,loaded_size,peak_vram_mb,processor,prefill_ms,ttft_ms,gen_tokens_per_sec
+f16,qwen2.5:1.5b,16384,1.6 GB,1644,100% GPU,17.6,199.7,105.8
+f16,llama3.1:8b-instruct-q4_K_M,8192,6.2 GB,2230,64%/36% CPU/GPU,1058.2,1285.3,7.4
+q8_0,qwen2.5:1.5b,16384,1.4 GB,1438,100% GPU,19.3,208.9,100.5
+q8_0,llama3.1:8b-instruct-q4_K_M,8192,5.7 GB,2362,58%/42% CPU/GPU,1064.0,1294.2,8.0
+q4_0,qwen2.5:1.5b,16384,1.3 GB,1326,100% GPU,0.0,217.4,0.0
+q4_0,llama3.1:8b-instruct-q4_K_M,8192,5.4 GB,2270,58%/42% CPU/GPU,3199.8,3826.1,5.1
