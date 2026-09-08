@@ -13,8 +13,9 @@ Bahasa Malaysia questions are supported.
 
 - **End-to-end local pipeline** — download → extract → store → embed → serve,
   all offline.
-- **Hybrid retrieval** — dense vectors (`BAAI/bge-m3`) combined with keyword
-  search over SQLite.
+- **Hybrid retrieval** — dense vectors (`BAAI/bge-m3`) and keyword search over
+  SQLite, combined with reciprocal-rank fusion; English query terms are mapped
+  to Malay so the keyword half fires on the Malay corpus too.
 - **Grounded answers with citations** — every claim is tied to a real speech via
   `[n]`, with source cards showing speaker, constituency, date and page.
 - **Bilingual** — language is detected per question and the answer is written in
@@ -42,7 +43,11 @@ ollama pull llama3.1:8b-instruct-q4_K_M
 # 3. grab the prebuilt index — no PDF download or embedding needed
 bash scripts/fetch_data.sh
 
-# 4. run it (API on :8000, web on :3000)
+# 4. optional — the QLoRA fine-tune (see finetune/), for the model selector's
+#    "Fine-tuned 1.5B" option and Compare mode; the base chat works without it
+bash scripts/fetch_model.sh
+
+# 5. run it (API on :8000, web on :3000)
 bash scripts/dev.sh
 ```
 
@@ -78,6 +83,31 @@ in with `DATA_TAG=data-v2 bash scripts/fetch_data.sh`.
 
 </details>
 
+<details>
+<summary><b>Maintainer: publishing the fine-tuned model</b></summary>
+
+`scripts/fetch_model.sh` downloads a public GitHub Release asset the same way.
+The fine-tuned model isn't in git (large binary), so after retraining:
+
+```bash
+# 1. package the exact deployed model + its Modelfile
+ollama show hansard-qwen --modelfile \
+  | sed 's|^FROM .*|FROM ./hansard-qwen.q4_K_M.gguf|' > Modelfile
+cp "$(ollama show hansard-qwen --modelfile | grep '^FROM ' | awk '{print $2}')" \
+  ./hansard-qwen.q4_K_M.gguf   # copies the raw GGUF blob out of Ollama's store
+tar -czf hansard-qwen-model.tar.gz hansard-qwen.q4_K_M.gguf Modelfile
+
+# 2. publish (web UI or gh CLI, same pattern as the data index)
+gh release create model-v1 hansard-qwen-model.tar.gz \
+  -t "Fine-tuned model" -n "QLoRA fine-tune (hansard-qwen), q4_K_M GGUF"
+```
+
+The tag (`model-v1`) and asset name (`hansard-qwen-model.tar.gz`) must match
+`scripts/fetch_model.sh`. A newer fine-tune under `model-v2` lets users opt in
+with `MODEL_TAG=model-v2 bash scripts/fetch_model.sh`.
+
+</details>
+
 Prefer containers? With Ollama running on the host and `data/` already built,
 `docker compose up --build` brings up the whole app (see [Docker](#docker)).
 
@@ -103,8 +133,59 @@ parlimen.gov.my PDFs
 ```
 
 Small local models are unreliable at strict formatting, so anything that must be
-exact — speaker names, citation numbering, output language, intros/conclusions —
+exact — speaker names, citation numbering, output language, the opening line —
 is handled deterministically in Python rather than left to the model.
+
+Given eight retrieved speeches the model also tends to emit eight items, padding
+with non-answers ("X did not give a specific opinion on…") for speeches that
+don't address the question. The prompt tells it to skip those, and a narrow
+post-processing filter drops any that slip through, then renumbers. That filter
+deliberately ignores a bare "did not answer" / "tidak menjawab": an MP pressing
+a minister for not answering is real, citable content.
+
+A subtler failure: the model anchors on the question's own wording even when a
+cited speech doesn't support it — asked about "sukan larian" (running events), a
+speech that only discusses sports funding in general still got summarised with a
+title like "Penganjuran Larian Sukan", inventing specificity the speech never
+states. An explicit "base it strictly on the source" prompt instruction alone did
+not stop this (verified over repeated runs), so it's also enforced
+deterministically: for each cited line, any of the question's specific terms
+that don't appear in *that line's own cited source* are stripped. Generic
+domain words (sukan, program, tahun, …) are excluded from this check — only
+narrow, topic-specific terms get scrubbed, so ordinary recurring vocabulary
+isn't second-guessed line by line.
+
+Deliberately absent: a canned closing paragraph. Templated conclusions ("these
+issues reflect the urgent need to address infrastructure…") read as fluent, but
+they are editorial claims with no source behind them and get appended whatever
+the question was — which contradicts the point of citing every claim with `[n]`.
+The cited list ends where the evidence ends. The opening line is kept, but
+worded count-neutrally, since when streaming it is emitted before the body
+exists and can't know whether one item or eight will follow.
+
+## Cross-lingual behaviour (and an honest limitation)
+
+The Hansard corpus is **predominantly Bahasa Malaysia**, so the two question
+languages take different paths:
+
+- **Malay questions — the native path.** Both halves of retrieval work
+  in-language (keyword `LIKE` matches the Malay text directly; dense `bge-m3`
+  vectors are in-language), and the model summarises Malay → Malay with **no
+  translation step**.
+- **English questions — a cross-lingual path.** `bge-m3` is multilingual so the
+  dense half still retrieves the right Malay speeches; the keyword half maps
+  common English topic terms to their Malay equivalents (`subsidies → subsidi`,
+  `education → pendidikan`) so it fires too. The two ranked lists are combined
+  with **reciprocal-rank fusion**, so a speech both halves agree on rises to the
+  top.
+
+Retrieval is made deliberately language-robust this way, but one gap is
+**inherent and not hidden**: at generation time an English answer must be
+*translated* from the Malay source, and a small quantised model translates
+imperfectly. So English answers can read slightly less faithfully than Malay
+ones even when the retrieved sources are identical — the residual difference is
+generation-side translation loss, not retrieval. Closing it further would mean a
+larger/stronger generation model rather than more retrieval work.
 
 ## Tech stack
 
@@ -124,6 +205,9 @@ is handled deterministically in Python rather than left to the model.
 library/myhansard/   downloader, extractor, storage, embedder, rag, bench
 scripts/             data pipeline, API server, benchmarks, dev runners
 web/                 Next.js chat UI and /eval benchmark page
+finetune/            QLoRA fine-tune: self-distill data, train, evaluate
+docs/                write-ups for each benchmark study, plus RAG lessons learned
+results/             raw benchmark CSVs + charts (referenced from docs/)
 tools/ui-design/     standalone UI design reference CLI (CSV-backed)
 ```
 
@@ -222,6 +306,33 @@ hide the latency. An offline sweep can be reproduced with:
 ```bash
 uv run python scripts/benchmark_quantization.py
 uv run python scripts/analyze_quantization.py
+```
+
+A second study profiles how retrieval count (prompt length) drives prefill/TTFT
+and where the KV cache sits — see
+[docs/context_length_benchmark.md](docs/context_length_benchmark.md):
+
+```bash
+CUDA_VISIBLE_DEVICES="" uv run python scripts/benchmark_context_length.py
+uv run python scripts/analyze_context_length.py
+```
+
+A third study compresses the **KV cache** (`OLLAMA_KV_CACHE_TYPE` f16/q8_0/q4_0
+with flash attention) and measures the VRAM freed and the effect on the 8B's
+CPU offload — see [docs/kv_cache_benchmark.md](docs/kv_cache_benchmark.md):
+
+```bash
+uv run python scripts/benchmark_kv_cache.py
+uv run python scripts/analyze_kv_cache.py
+```
+
+A fourth study profiles **model-load transfer** (NVMe → system RAM → VRAM) —
+cold vs page-cache-warm loads per model size — see
+[docs/nvme_load_benchmark.md](docs/nvme_load_benchmark.md):
+
+```bash
+uv run python scripts/benchmark_nvme.py
+uv run python scripts/analyze_nvme.py
 ```
 
 ## Design reference CLI

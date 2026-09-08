@@ -12,5 +12,14 @@ data/
 # Prebuilt-index tarball (published to a GitHub Release, not committed)
 hansard-data.tar.gz
 
-# IDE settings
+# IDE / tool settings
 .vscode/
+.claude/
+
+# Fine-tuned model artifacts (safetensors/gguf, large — not committed)
+hansard-qwen-gguf/
+*.gguf
+hansard-qwen-gguf.zip
+
+# fine-tune intermediate (train.jsonl + val.jsonl are the committed split)
+finetune/examples.jsonl

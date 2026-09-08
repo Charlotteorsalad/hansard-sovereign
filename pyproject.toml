@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "myhansard"
 version = "0.1.0"
-description = "A library to download Malaysian Parliament Hansard PDFs"
+description = "On-premise RAG over Malaysian Parliament Hansard debates: ingestion, hybrid retrieval, local LLM generation, and inference benchmarking"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -35,3 +35,9 @@ fix = true
 
 [tool.ruff.format]
 quote-style = "double"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "pandas>=2.3.3",
+]
