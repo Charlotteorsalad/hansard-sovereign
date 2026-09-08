@@ -1,7 +1,7 @@
 # UI Design Reference
 
 A searchable design reference for web and mobile work: 67 styles, 96 color
-palettes, 57 font pairings, 99 UX guidelines, and 25 chart types across 13
+palettes, 56 font pairings, 98 UX guidelines, and 25 chart types across 13
 technology stacks, with priority-based recommendations.
 
 The data lives in [data/](data/) as CSV tables; [scripts/](scripts/) provides a
@@ -140,7 +140,7 @@ python3 tools/ui-design/scripts/search.py "<product_type> <industry> <keywords>"
 ```
 
 This command:
-1. Searches 5 domains in parallel (product, style, color, landing, typography)
+1. Searches 5 domains (product, style, color, landing, typography)
 2. Applies reasoning rules from `ui-reasoning.csv` to select best matches
 3. Returns complete design system: pattern, style, colors, typography, effects
 4. Includes anti-patterns to avoid
@@ -158,9 +158,10 @@ To save the design system for hierarchical retrieval across sessions, add `--per
 python3 tools/ui-design/scripts/search.py "<query>" --design-system --persist -p "Project Name"
 ```
 
-This creates:
-- `design-system/MASTER.md` — Global Source of Truth with all design rules
-- `design-system/pages/` — Folder for page-specific overrides
+This creates, under a folder named for the project (`-p` value, lowercased
+with spaces replaced by `-`; `default` if omitted):
+- `design-system/<project>/MASTER.md` — Global Source of Truth with all design rules
+- `design-system/<project>/pages/` — Folder for page-specific overrides
 
 **With page-specific override:**
 ```bash
@@ -168,12 +169,15 @@ python3 tools/ui-design/scripts/search.py "<query>" --design-system --persist -p
 ```
 
 This also creates:
-- `design-system/pages/dashboard.md` — Page-specific deviations from Master
+- `design-system/<project>/pages/dashboard.md` — Page-specific deviations from Master
 
 **How hierarchical retrieval works:**
-1. When building a specific page (e.g., "Checkout"), first check `design-system/pages/checkout.md`
+1. When building a specific page (e.g., "Checkout"), first check `design-system/<project>/pages/checkout.md`
 2. If the page file exists, its rules **override** the Master file
-3. If not, use `design-system/MASTER.md` exclusively
+3. If not, use `design-system/<project>/MASTER.md` exclusively
+
+Pass `--output-dir <path>` to write the `design-system/` folder somewhere
+other than the current directory.
 
 ### Step 3: Supplement with Detailed Searches (as needed)
 
@@ -220,7 +224,11 @@ Available stacks: `html-tailwind`, `react`, `nextjs`, `vue`, `svelte`, `swiftui`
 | `ux` | Best practices, anti-patterns | animation, accessibility, z-index, loading |
 | `react` | React/Next.js performance | waterfall, bundle, suspense, memo, rerender, cache |
 | `web` | Web interface guidelines | aria, focus, keyboard, semantic, virtualize |
-| `prompt` | AI prompts, CSS keywords | (style name) |
+| `icons` | Icon libraries and usage | lucide, heroicons, symbol, glyph, pictogram |
+
+`--domain` only accepts the values above — AI-prompt / CSS keywords are
+part of the `style` domain's data (searched via a plain keyword query, not a
+separate `--domain prompt`).
 
 ### Available Stacks
 
@@ -236,6 +244,9 @@ Available stacks: `html-tailwind`, `react`, `nextjs`, `vue`, `svelte`, `swiftui`
 | `flutter` | Widgets, State, Layout, Theming |
 | `shadcn` | shadcn/ui components, theming, forms, patterns |
 | `jetpack-compose` | Composables, Modifiers, State Hoisting, Recomposition |
+| `astro` | Architecture, components, data, integrations, markdown, performance |
+| `nuxtjs` | Data fetching, auto-imports, middleware, lifecycle, performance |
+| `nuxt-ui` | Nuxt UI components, theming, accessibility, dashboard, color mode |
 
 ---
 
