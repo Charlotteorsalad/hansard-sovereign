@@ -27,7 +27,7 @@ retraining the fine-tune itself.
 ## Workflow
 
 ```
-build_finetune_data.py   →  train_qlora.py (Colab T4)  →  Ollama  →  evaluate.py
+build_finetune_data.py   →  train_qlora.ipynb (Colab T4)  →  Ollama  →  evaluate.py
    (local, CPU)               (GPU training)              (deploy)     (measure)
 ```
 
@@ -41,7 +41,7 @@ Slow (the 8B teacher spills to CPU) — it writes incrementally to
 `examples.jsonl`, so progress survives interruption.
 
 ### 2. Train on Colab (free T4 — the 4 GB laptop can't train)
-Open `train_qlora.py` in Colab (cells are `# %%`-delimited), upload
+Open `train_qlora.ipynb` in Colab, upload
 `train.jsonl` + `val.jsonl`, run top to bottom. It:
 - loads Qwen2.5-1.5B in 4-bit, attaches LoRA adapters (QLoRA),
 - trains ~3 epochs with loss on the answer only,
@@ -115,7 +115,7 @@ A `num_predict` cap is still kept as a safety net.
 | File | Role |
 | --- | --- |
 | `build_finetune_data.py` | self-distill the dataset from the production pipeline |
-| `train_qlora.py` | Colab QLoRA training + GGUF export |
+| `train_qlora.ipynb` | Colab QLoRA training + GGUF export |
 | `evaluate.py` | base vs fine-tuned format-adherence |
 | `train.jsonl` / `val.jsonl` | generated dataset (small; committed as evidence) |
 | `Modelfile` | the actual working Modelfile, exported from the deployed model — pairs with the `.gguf` in the `model-v1` GitHub Release (`scripts/fetch_model.sh`) |
