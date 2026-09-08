@@ -15,6 +15,11 @@ import myhansard
 # (e.g. http://host.docker.internal:11434).
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Generation model. Default is the 8B (strongest content grounding); set
+# RAG_MODEL=hansard-qwen to serve the QLoRA fine-tune instead — a fast,
+# fully-GPU-resident 1.5B that emits the citation format natively.
+DEFAULT_MODEL = os.environ.get("RAG_MODEL", "llama3.1:8b-instruct-q4_K_M")
+
 # Built once at import; loading the language models is expensive. English vs Malay only.
 _DETECTOR = (
     LanguageDetectorBuilder.from_languages(Language.ENGLISH, Language.MALAY)
@@ -27,66 +32,124 @@ def _detect_lang(query: str) -> str:
     return "Bahasa Malaysia" if lang == Language.MALAY else "English"
 
 
-# Intro/conclusion templates. Generated in Python so the wording is reliable and
-# varies per call, rather than left to the model.
+# Function words dropped from the keyword pass: a Malay "yang"/"dalam" or an
+# English "the"/"what" appears in nearly every speech, so LIKE-matching them
+# just returns noise. Filtering them sharpens keyword precision in BOTH
+# languages (this also removes the "say" -> "saya" substring false-match).
+_STOP = {
+    # English
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "by",
+    "from", "that", "this", "these", "those", "is", "are", "was", "were", "be",
+    "did", "do", "does", "what", "who", "how", "why", "when", "where", "any",
+    "about", "say", "said", "says", "raised", "raise", "discussed", "discuss",
+    "issue", "issues", "member", "members", "parliament", "government", "there",
+    # Malay
+    "apa", "apakah", "yang", "tentang", "mengenai", "dalam", "untuk", "adakah",
+    "oleh", "itu", "ini", "dan", "atau", "di", "ke", "dari", "pada", "dengan",
+    "telah", "akan", "ada", "kah", "sebarang", "isu", "isu-isu", "ahli",
+    "parlimen", "kerajaan", "berkenaan", "berkaitan", "dibangkitkan",
+}
+
+# The corpus is Malay, so an English question's keywords ("subsidies") never
+# LIKE-match the source text. Map common English topic terms to their Malay
+# equivalents so the keyword half of hybrid retrieval fires for English queries
+# too. (The dense bge-m3 half is already cross-lingual; this restores the other
+# half.) Multi-word phrases are matched as substrings before tokenising.
+_EN_PHRASES = {
+    "cost of living": ["sara hidup", "kos sara hidup"],
+    "flood mitigation": ["tebatan banjir"],
+    "public transport": ["pengangkutan awam"],
+    "affordable housing": ["perumahan mampu milik"],
+    "national security": ["keselamatan negara"],
+    "clean water": ["air bersih"],
+}
+_EN_TO_MS = {
+    "subsidy": ["subsidi"], "subsidies": ["subsidi"],
+    "fuel": ["minyak", "petrol", "diesel"], "petrol": ["petrol"],
+    "education": ["pendidikan", "pelajaran"], "school": ["sekolah"],
+    "schools": ["sekolah"], "student": ["pelajar"], "students": ["pelajar"],
+    "health": ["kesihatan"], "healthcare": ["kesihatan"],
+    "hospital": ["hospital"], "hospitals": ["hospital"],
+    "flood": ["banjir"], "floods": ["banjir"],
+    "transport": ["pengangkutan"], "transportation": ["pengangkutan"],
+    "housing": ["perumahan"], "house": ["rumah"], "homes": ["rumah"],
+    "crime": ["jenayah"], "corruption": ["rasuah"],
+    "tax": ["cukai"], "taxes": ["cukai"], "taxation": ["cukai"],
+    "employment": ["pekerjaan"], "job": ["pekerjaan"], "jobs": ["pekerjaan"],
+    "unemployment": ["pengangguran"],
+    "digital": ["digital"], "digitalisation": ["pendigitalan"],
+    "digitalization": ["pendigitalan"],
+    "agriculture": ["pertanian"], "farmer": ["petani"], "farmers": ["petani"],
+    "environment": ["alam", "sekitar", "persekitaran"],
+    "security": ["keselamatan"], "economy": ["ekonomi"], "economic": ["ekonomi"],
+    "water": ["air"], "wage": ["gaji", "upah"], "wages": ["gaji", "upah"],
+    "salary": ["gaji"], "development": ["pembangunan"], "minister": ["menteri"],
+    "budget": ["belanjawan", "bajet"], "poverty": ["kemiskinan"],
+    "welfare": ["kebajikan"], "infrastructure": ["infrastruktur"],
+    "road": ["jalan"], "roads": ["jalan"], "children": ["kanak-kanak"],
+    "women": ["wanita"], "youth": ["belia"], "religion": ["agama"],
+    "language": ["bahasa"], "flooding": ["banjir"], "subsidised": ["subsidi"],
+}
+
+
+def _keyword_terms(query: str) -> list[str]:
+    """Content words for the keyword half of retrieval.
+
+    Drops stopwords/very short tokens, and — because the corpus is Malay — maps
+    English topic terms (words and a few phrases) to their Malay equivalents so
+    an English question's keyword pass still matches the source text.
+    """
+    ql = query.lower()
+    terms: list[str] = []
+
+    english = _detect_lang(query) == "English"
+    if english:
+        for phrase, mapped in _EN_PHRASES.items():
+            if phrase in ql:
+                terms.extend(mapped)
+
+    words = [w.strip(".,;:!?'\"()[]") for w in ql.split()]
+    for w in words:
+        if len(w) > 2 and w not in _STOP:
+            terms.append(w)
+            if english:
+                terms.extend(_EN_TO_MS.get(w, []))
+
+    return list(dict.fromkeys(terms))  # preserve order, drop duplicates
+
+
+# Intro templates. Generated in Python so the wording and language are reliable
+# rather than left to the model (small models drift on both).
+#
+# They must be COUNT-NEUTRAL: when streaming, the intro is emitted before the
+# body exists, so we can't know whether the answer will hold one item or eight.
+# Nothing here may claim "several"/"beberapa" or force a plural ("isu-isu").
+# Malay doesn't mark plural obligatorily, so dropping those makes it neutral.
+#
+# There is deliberately NO conclusion template. A canned closing line ("these
+# issues reflect the urgent need to address infrastructure...") is an editorial
+# claim with no source behind it, and it was appended to every answer regardless
+# of topic — directly at odds with a system whose answers are grounded in [n]
+# citations. The cited list is the answer; it ends where the evidence ends.
 _INTROS_MS = [
-    "Ya, beberapa isu telah dibangkitkan dalam sidang Dewan Rakyat."
-    " Berikut adalah ringkasannya:",
-    "Terdapat beberapa isu yang telah dibincangkan dalam Parlimen."
-    " Berikut adalah senarai isu tersebut:",
-    "Beberapa ahli parlimen telah membangkitkan isu-isu berikut"
-    " dalam sidang Dewan Rakyat:",
-    "Dalam sidang Dewan Rakyat, beberapa isu penting telah dibangkitkan."
-    " Berikut adalah senarai isu yang dikemukakan:",
-    "Isu-isu berikut telah dikemukakan oleh beberapa ahli parlimen"
-    " dalam sidang Dewan Rakyat:",
+    "Berikut adalah perkara yang dibangkitkan dalam sidang Dewan Rakyat:",
+    "Berdasarkan rekod Hansard, berikut yang dibangkitkan dalam Parlimen:",
+    "Berikut adalah ringkasan daripada sidang Dewan Rakyat:",
+    "Daripada rekod sidang Dewan Rakyat:",
+    "Berikut perkara yang dibincangkan dalam Parlimen:",
 ]
 
 _INTROS_EN = [
-    "Yes, several issues were raised during the Dewan Rakyat session."
-    " Here is a summary:",
-    "The following issues were brought up in Parliament:",
-    "Several members of parliament raised the following issues"
-    " during the Dewan Rakyat sitting:",
-    "Here are the issues raised in the parliamentary session:",
-    "A number of issues were debated in the Dewan Rakyat."
-    " Below is a summary:",
-]
-
-_CONCLUSIONS_MS = [
-    "Secara keseluruhan, isu-isu ini mencerminkan keperluan mendesak"
-    " untuk menangani masalah bekalan dan infrastruktur di Malaysia.",
-    "Kesimpulannya, pelbagai isu berkaitan perkhidmatan awam telah"
-    " mendapat perhatian serius daripada ahli parlimen.",
-    "Semua isu ini menunjukkan perlunya kerajaan mengambil tindakan segera"
-    " bagi memastikan kesejahteraan rakyat.",
-    "Isu-isu ini mencerminkan keperluan dasar yang komprehensif untuk"
-    " menangani cabaran infrastruktur negara.",
-    "Secara keseluruhannya, isu-isu ini menggambarkan cabaran yang"
-    " dihadapi rakyat dan perlunya penyelesaian segera.",
-]
-
-_CONCLUSIONS_EN = [
-    "In summary, these issues reflect the urgent need to address"
-    " infrastructure and public service challenges in Malaysia.",
-    "Overall, parliament members have raised significant concerns"
-    " that require immediate government attention.",
-    "These issues collectively highlight the need for comprehensive"
-    " policy solutions to improve public services.",
-    "In conclusion, these debates underscore the importance of timely"
-    " government action on essential services.",
-    "Together, these issues demonstrate the ongoing challenges faced"
-    " by citizens and the need for effective solutions.",
+    "Here is what was raised in the Dewan Rakyat, based on the Hansard record:",
+    "The following was raised during the Dewan Rakyat sitting:",
+    "From the Hansard record of the Dewan Rakyat:",
+    "Here is a summary of what was discussed in Parliament:",
+    "Based on the parliamentary record:",
 ]
 
 
 def _random_intro(lang: str) -> str:
     return random.choice(_INTROS_EN if lang == "English" else _INTROS_MS)
-
-
-def _random_conclusion(lang: str) -> str:
-    pool = _CONCLUSIONS_EN if lang == "English" else _CONCLUSIONS_MS
-    return random.choice(pool)
 
 
 # Speaker parsing
@@ -99,7 +162,7 @@ _ROLE_RE = re.compile(r"\bMenteri\b|\bPengerusi\b|Yang di-Pertua", re.IGNORECASE
 
 
 def _format_speaker(speaker_raw: str) -> str:
-    """Turn "Tuan Khoo Poay Tiong [Kota Melaka]" into "Tuan Khoo Poay Tiong (Kota Melaka)".
+    """Turn "Tuan Khoo Poay Tiong [Kota Melaka]" into the "(Kota Melaka)" form.
 
     Handles role-prefixed and number-prefixed variants. Mirrors the frontend's
     parseSource() so context names match the source cards.
@@ -217,7 +280,16 @@ def _auto_cite(text: str, speeches: list) -> str:
 
     def _cite(segment: str) -> str:
         segment = segment.strip()
-        if not segment or re.search(r"\[\d+\]", segment):
+        if not segment:
+            return segment
+        # Never trust the model's own [n] — a weaker model mislabels which source
+        # a line refers to. Strip whatever it wrote and re-derive the citation
+        # from content (speaker + summary vs the retrieved speech), so [n] always
+        # points at the source the line actually describes.
+        segment = re.sub(r"\s*\[\d+(?:\s*,\s*\d+)*\]", "", segment)
+        segment = re.sub(r"\s*\[\d+\s*$", "", segment)  # dangling "[8" (no close)
+        segment = re.sub(r"\s+([.!?,;:])", r"\1", segment).strip()
+        if not segment:
             return segment
         seg_words = set(re.sub(r"[^\w\s]", "", segment).lower().split()) - stop
         best_idx, best_score = None, 0
@@ -268,18 +340,38 @@ def _retrieve(query: str, collection, conn) -> list:
     ids = [m["id"] for m in results["metadatas"][0]]
 
     cursor = conn.cursor()
-    keywords = query.replace("?", "").split()
-    keyword_conditions = " OR ".join([f"content LIKE '%{k}%'" for k in keywords])
-    cursor.execute(
-        "SELECT id FROM speeches"
-        f" WHERE ({keyword_conditions}) AND LENGTH(content) > 100 LIMIT 10"
-    )
-    keyword_ids = [row[0] for row in cursor.fetchall()]
+    keywords = _keyword_terms(query)
+    if keywords:
+        # Bind each %keyword% as a parameter — never interpolate into the SQL,
+        # or a keyword containing a quote (e.g. a name like "Dato'") both breaks
+        # the statement and opens a SQL-injection hole. Rank the matches by how
+        # many distinct query terms each speech contains, so the most on-topic
+        # keyword hits lead (a real ranked list to fuse with the vectors).
+        like_params = [f"%{k}%" for k in keywords]
+        conditions = " OR ".join("content LIKE ?" for _ in keywords)
+        hits_expr = " + ".join("(content LIKE ?)" for _ in keywords)
+        cursor.execute(
+            "SELECT id FROM speeches"
+            f" WHERE ({conditions}) AND LENGTH(content) > 100"
+            f" ORDER BY ({hits_expr}) DESC LIMIT 10",
+            like_params + like_params,  # first N for WHERE, next N for the score
+        )
+        keyword_ids = [row[0] for row in cursor.fetchall()]
+    else:
+        keyword_ids = []
 
-    # Vector hits are relevance-ranked; keep that order, append keyword extras,
-    # dedup, cap at 8. A smaller context keeps prompt-eval (and time-to-first-token)
-    # fast on GPU-limited hardware and keeps the source list readable.
-    ordered_ids = list(dict.fromkeys(ids + keyword_ids))[:8]
+    # Reciprocal-rank fusion of the two ranked lists (dense vectors + keyword).
+    # A speech both halves agree on rises to the top, and keyword-confirmed hits
+    # actually enter the context — previously 10 vector hits filled every slot
+    # and the keyword half was inert, so "hybrid" was vector-only in practice.
+    # This is what lets an English question (whose terms are mapped to Malay in
+    # _keyword_terms) pull the right Malay speeches up. Cap at 8: a small context
+    # keeps prompt-eval / TTFT fast on GPU-limited hardware and the list short.
+    scores: dict = {}
+    for rank_list in (ids, keyword_ids):
+        for rank, _id in enumerate(rank_list):
+            scores[_id] = scores.get(_id, 0.0) + 1.0 / (rank + 60)  # RRF, k=60
+    ordered_ids = sorted(scores, key=lambda i: scores[i], reverse=True)[:8]
     placeholders = ",".join("?" * len(ordered_ids))
     cursor.execute(
         "SELECT id, speaker_raw, content, date, source_file, page FROM speeches"
@@ -322,6 +414,16 @@ def _build_prompt(query: str, speeches: list) -> str:
         f" IN {lang.upper()}.\n\n"
         f"Output ONLY a numbered list. Each line MUST be:\n"
         f"N. **3-5 word title**: Speaker (Constituency) one sentence summary [n].\n\n"
+        f"Include ONLY speeches that actually answer the question. Skip the"
+        f" rest — there is no need to use every speech, and three real answers"
+        f" are better than eight padded ones. NEVER write an item saying a"
+        f" speaker gave no view, did not comment, or is not relevant.\n\n"
+        f"Base each title and summary STRICTLY on what that speech itself says."
+        f" Do not borrow specific words or activities from the Question that the"
+        f" speech does not itself mention — e.g. if the question asks about a"
+        f" specific activity but a speech only discusses the broader topic in"
+        f" general, describe it as general, not as if it addressed that specific"
+        f" activity.\n\n"
         f"Example (write yours in {lang}):\n{example}\n\n"
         f"Context:\n{numbered_context}\n\n"
         f"Question: {query}\n\n"
@@ -330,10 +432,12 @@ def _build_prompt(query: str, speeches: list) -> str:
 
 
 def _build_system(lang: str) -> str:
-    source = "Malay" if lang == "English" else "English"
+    # The Hansard corpus is predominantly Malay (with some English speeches),
+    # whatever language the question is in — so state that honestly rather than
+    # flipping the "source language" with the answer language.
     return (
         "You are a parliamentary research assistant that summarises Hansard "
-        f"debates. The source text is in {source}, but you MUST write your "
+        "debates. The source text is mainly in Malay, but you MUST write your "
         f"ENTIRE answer in {lang} only — do not use any other language "
         "(keep proper nouns such as names and places as-is). "
         "Summarise each issue in your own words, but always keep the "
@@ -345,7 +449,11 @@ _TEMPERATURE = 0.3
 
 
 def _options() -> dict:
-    return {"temperature": _TEMPERATURE, "seed": random.randint(0, 99999)}
+    # num_predict bounds the answer: the summaries are short lists, and it stops
+    # a model that doesn't emit EOS cleanly (e.g. the small fine-tune) from
+    # generating to the context limit.
+    return {"temperature": _TEMPERATURE, "seed": random.randint(0, 99999),
+            "num_predict": 512}
 
 
 def _sources_payload(speeches: list) -> list:
@@ -375,8 +483,113 @@ def _well_formatted(text: str) -> bool:
     return sum("**" in ln for ln in _list_items(text)) >= 2
 
 
+# Safety net for padding. Given 8 retrieved speeches the model tends to emit 8
+# items, inventing a non-answer ("X did not give a specific opinion on ...")
+# for any speech that doesn't address the question. Such an item carries no
+# information and cites a source that doesn't support it.
+#
+# Deliberately narrow: it matches only the "no view was expressed" summarising
+# construction. It must NOT match a bare "tidak menjawab" / "did not answer",
+# because an MP pressing a minister for not answering is real, citable content
+# — that phrasing is left alone on purpose.
+_NON_ANSWER_RE = re.compile(
+    r"tidak\s+(?:mem)?beri(?:kan)?\s+(?:sebarang\s+)?(?:pandangan|komen|maklum)"
+    r"|tidak\s+menyatakan\s+(?:sebarang\s+)?(?:pandangan|komen)"
+    r"|tidak\s+menyentuh|tidak\s+membincangkan"
+    r"|tidak\s+(?:berkaitan|relevan)\s+dengan\s+(?:soalan|persoalan)"
+    r"|tidak\s+ada\s+jawapan\s+yang\s+jelas"
+    r"|did\s+not\s+(?:give|provide|offer|express|state|share)\s+"
+    r"(?:a\s+|an\s+|any\s+)?(?:specific\s+)?(?:opinion|view|comment|position)"
+    r"|did\s+not\s+(?:specifically\s+)?(?:comment|mention|address|discuss)"
+    r"|do(?:es)?\s+not\s+(?:specifically\s+)?(?:address|mention|discuss|relate)"
+    r"|no\s+(?:specific\s+)?(?:opinion|view|comment)s?\s+(?:was|were|given)"
+    r"|no\s+clear\s+answer"
+    r"|(?:is|are)\s+not\s+relevant\s+to\s+the\s+question",
+    re.IGNORECASE,
+)
+_NUMBERED_RE = re.compile(r"^\s*\d+[.)]\s")
+
+
+def _drop_non_answers(body: str) -> str:
+    """Drop padded "this speaker said nothing about it" items and renumber.
+
+    If every item looks like a non-answer the body is returned untouched —
+    better to show a weak answer than an empty one.
+    """
+    lines = body.split("\n")
+    kept = [
+        ln
+        for ln in lines
+        if not (_ITEM_RE.match(ln) and _NON_ANSWER_RE.search(ln))
+    ]
+    if not any(_ITEM_RE.match(ln) for ln in kept):
+        return body
+
+    out, n = [], 0
+    for ln in kept:
+        if _NUMBERED_RE.match(ln):  # renumber only digits; leave bullets alone
+            n += 1
+            ln = _NUMBERED_RE.sub(f"{n}. ", ln)
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+# Generic domain vocabulary that recurs in almost any Hansard sports/parliament
+# answer regardless of which specific source got cited. Excluded from the
+# grounding scrub below so it only checks genuinely narrow/specific query terms
+# (like "larian" = running) rather than words that are expected to recur no
+# matter which speech was actually cited.
+_GENERIC_GROUNDING_TERMS = {
+    "sukan", "program", "tahun", "acara", "penganjuran", "pandangan",
+    "perkara", "soalan", "persoalan", "dana", "peruntukan", "kementerian",
+    "sports", "programme", "issue", "issues", "question", "questions",
+    "view", "views", "members", "member", "parliament",
+}
+_CITE_NUMS_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def _scrub_ungrounded_terms(body: str, query: str, speeches: list) -> str:
+    """Strip a query's own specific wording from a line whose cited source
+    doesn't actually contain it.
+
+    Small models anchor on the literal question: asked about "sukan larian"
+    (running), a source that only discusses sports funding in general can
+    still get summarised with a title like "Penganjuran Larian Sukan" —
+    inventing a level of specificity the cited speech never states. Verified
+    this keeps happening even with an explicit "base it strictly on the
+    source, don't borrow the question's wording" prompt instruction (4/4
+    repeated test runs still injected it), so it's enforced deterministically
+    here instead of trusting the prompt alone.
+    """
+    terms = [
+        t for t in dict.fromkeys(_keyword_terms(query))
+        if t not in _GENERIC_GROUNDING_TERMS and len(t) > 3
+    ]
+    if not terms:
+        return body
+
+    out = []
+    for ln in body.split("\n"):
+        m = _CITE_NUMS_RE.search(ln)
+        if not m:
+            out.append(ln)
+            continue
+        idxs = [int(x) for x in m.group(1).replace(" ", "").split(",")]
+        cited_text = " ".join(
+            speeches[i - 1][2] for i in idxs if 1 <= i <= len(speeches)
+        ).lower()
+        for term in terms:
+            pat = rf"\b{re.escape(term)}\b"
+            if re.search(pat, ln, re.IGNORECASE) and not re.search(pat, cited_text):
+                ln = re.sub(rf"\s*{pat}", "", ln, flags=re.IGNORECASE)
+        ln = re.sub(r"\s+([.,;:!?])", r"\1", ln)  # tidy space before punctuation
+        ln = re.sub(r"[ \t]{2,}", " ", ln).rstrip()
+        out.append(ln)
+    return "\n".join(out)
+
+
 def _generate_body(
-    prompt: str, system: str, speeches: list, model: str, tries: int = 2
+    prompt: str, system: str, speeches: list, model: str, query: str, tries: int = 2
 ) -> str:
     """Call the model, retrying with a fresh seed when it drifts off-format.
 
@@ -409,20 +622,20 @@ def _generate_body(
             fallback = raw  # good enough; keep it in case later attempts fail
     else:
         raw = fallback or raw
-    return _auto_cite(raw, speeches)
+    body = _scrub_ungrounded_terms(_auto_cite(raw, speeches), query, speeches)
+    return _drop_non_answers(body)
 
 
 def answer(
-    query: str, collection, conn, model: str = "llama3.1:8b-instruct-q4_K_M"
+    query: str, collection, conn, model: str = DEFAULT_MODEL
 ) -> dict:
     speeches = _retrieve(query, collection, conn)
     lang = _detect_lang(query)
     prompt = _build_prompt(query, speeches)
 
-    body = _generate_body(prompt, _build_system(lang), speeches, model)
+    body = _generate_body(prompt, _build_system(lang), speeches, model, query)
     intro = _random_intro(lang)
-    conclusion = _random_conclusion(lang)
-    answer_text = f"{intro}\n\n{body}\n\n{conclusion}" if body else intro
+    answer_text = f"{intro}\n\n{body}" if body else intro
 
     return {"answer": answer_text, "sources": _sources_payload(speeches)}
 
@@ -439,7 +652,7 @@ def _stream_typing(text: str, delay: float = 0.012) -> Generator[dict, None, Non
 
 
 def stream_answer(
-    query: str, collection, conn, model: str = "llama3.1:8b-instruct-q4_K_M"
+    query: str, collection, conn, model: str = DEFAULT_MODEL
 ) -> Generator[dict, None, None]:
     """Yield SSE-style dicts:
 
@@ -456,7 +669,6 @@ def stream_answer(
     lang = _detect_lang(query)
     prompt = _build_prompt(query, speeches)
     intro = _random_intro(lang)
-    conclusion = _random_conclusion(lang)
 
     yield from _stream_typing(intro)
 
@@ -512,17 +724,16 @@ def stream_answer(
                 yield {"type": "token", "text": pending}
                 pending = ""
 
-    body = _auto_cite(full_text, speeches)
+    body = _scrub_ungrounded_terms(_auto_cite(full_text, speeches), query, speeches)
+    body = _drop_non_answers(body)
 
     if body:
         # Short prose that never tripped the live threshold: emit it now.
         if not body_started:
             yield {"type": "token", "text": "\n\n"}
             yield from _stream_typing(body)
-        yield {"type": "token", "text": "\n\n"}
-        yield from _stream_typing(conclusion)
 
-    final_answer = f"{intro}\n\n{body}\n\n{conclusion}" if body else intro
+    final_answer = f"{intro}\n\n{body}" if body else intro
     yield {
         "type": "done",
         "answer": final_answer,

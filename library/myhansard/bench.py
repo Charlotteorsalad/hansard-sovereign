@@ -10,6 +10,7 @@ import time
 
 import requests
 
+from .embedder import query_speeches
 from .rag import (
     OLLAMA_BASE_URL,
     _build_prompt,
@@ -39,20 +40,24 @@ def gpu_used_mb() -> int | None:
 
 
 def gpu_info() -> dict:
-    """GPU name, total VRAM and driver. nvidia-smi is flaky under WSL, so fall
-    back to the known dev-box spec rather than failing the whole request."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=name,memory.total,driver_version",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip().splitlines()[0]
-        name, vram, driver = (p.strip() for p in out.split(","))
-        return {"gpu": name, "vram_mb": int(vram), "driver": driver}
-    except Exception:
-        return {"gpu": "NVIDIA RTX A2000 Laptop GPU", "vram_mb": 4096,
-                "driver": "581.95"}
+    """GPU name, total VRAM and driver, read from nvidia-smi. If it can't be read
+    (no NVIDIA GPU, or inside a container), return honest 'not detected' values —
+    never fabricate a spec. nvidia-smi is occasionally flaky under WSL, so retry
+    a few times before giving up."""
+    for _ in range(3):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=name,memory.total,driver_version",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            if out:
+                name, vram, driver = (p.strip() for p in out.splitlines()[0].split(","))
+                return {"gpu": name, "vram_mb": int(vram), "driver": driver}
+        except Exception:
+            pass
+    return {"gpu": "GPU not detected", "vram_mb": 0, "driver": ""}
 
 
 def processor_split(model: str) -> str:
@@ -179,3 +184,72 @@ def live_benchmark(model: str, query: str, collection, conn):
            "total_time_ms": round(total * 1000, 1), "tokens": tok_n,
            "tokens_per_sec": round(tps, 1), "peak_vram_mb": peak_vram,
            "processor": processor}
+
+
+# --------------------------------------------------------------------------- #
+# Context-length / KV-cache profiling: one (query, N) point
+# --------------------------------------------------------------------------- #
+# Big enough that even N=50 (~11.5k tokens) isn't truncated; output capped so
+# total time is dominated by prefill, not decode.
+CONTEXT_OPTIONS = {"temperature": 0.3, "seed": 42, "num_predict": 200,
+                   "num_ctx": 12288}
+CONTEXT_N_VALUES = [3, 5, 10, 20, 30, 50]
+
+
+def _speech_pool(query: str, collection, conn, k: int = 60) -> list:
+    """Ranked pool of up to k real speeches for the query (vector order)."""
+    res = query_speeches(collection, query, n_results=k)
+    ids = [m["id"] for m in res["metadatas"][0]]
+    cur = conn.cursor()
+    placeholders = ",".join("?" * len(ids))
+    cur.execute(
+        "SELECT id, speaker_raw, content, date, source_file, page FROM speeches"
+        f" WHERE id IN ({placeholders})",
+        ids,
+    )
+    by_id = {r[0]: r for r in cur.fetchall() if len(r[2].strip()) > 100}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def context_run(model: str, query: str, n_results: int, collection, conn) -> dict:
+    """Run ONE generation with the top-`n_results` speeches as context and return
+    the engine's prefill metrics — the per-point measurement behind the /eval
+    context-length curve.
+
+    A unique nonce is prepended to the prompt so Ollama can't reuse a cached
+    prefill (it reuses the longest common prefix), giving a true cold prefill.
+    """
+    pool = _speech_pool(query, collection, conn)
+    n = min(n_results, len(pool))
+    prompt = _build_prompt(query, pool[:n])
+    system = _build_system(_detect_lang(query))
+    busted = f"<!--{n}-{time.perf_counter_ns()}-->\n{prompt}"
+
+    start = time.perf_counter()
+    done = {}
+    with VramSampler() as vram:
+        with requests.post(
+            OLLAMA_GENERATE,
+            json={"model": model, "system": system, "prompt": busted,
+                  "stream": True, "options": CONTEXT_OPTIONS},
+            stream=True, timeout=600,
+        ) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("done"):
+                    done = obj
+        total_ms = (time.perf_counter() - start) * 1000
+        peak_vram = vram.peak
+
+    ns = 1_000_000  # ns -> ms
+    return {
+        "n_results": n,
+        "prompt_tokens": done.get("prompt_eval_count", 0),
+        "prefill_ms": round(done.get("prompt_eval_duration", 0) / ns, 1),
+        "total_time_ms": round(total_ms, 1),
+        "gen_tokens": done.get("eval_count", 0),
+        "peak_vram_mb": peak_vram,
+    }
