@@ -10,9 +10,15 @@ import myhansard
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from myhansard.bench import gpu_info, list_models, live_benchmark
+from myhansard.bench import (
+    CONTEXT_N_VALUES,
+    context_run,
+    gpu_info,
+    list_models,
+    live_benchmark,
+)
 from myhansard.embedder import _get_query_model
-from myhansard.rag import answer, stream_answer
+from myhansard.rag import DEFAULT_MODEL, answer, stream_answer
 from pydantic import BaseModel
 
 DB_PATH = Path("data/hansard.db")
@@ -75,6 +81,13 @@ def _build_suggestion_facts() -> dict:
 
 
 def _build_suggestions() -> list[str]:
+    """Pick 4 example questions from real corpus facts (topics/members/dates).
+
+    Freshly randomised on every call — the frontend controls the cadence by
+    calling this once per genuinely new chat (not on every render), so this
+    only needs to vary from call to call rather than manage its own rotation
+    schedule.
+    """
     facts = _suggest_cache.setdefault("facts", _build_suggestion_facts())
     out: list[str] = []
 
@@ -114,6 +127,7 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     query: str
+    model: str | None = None  # let the UI pick 8B vs the fine-tune; None = default
 
 
 @app.get("/suggestions")
@@ -123,14 +137,16 @@ def suggestions():
 
 @app.post("/query")
 def query(request: QueryRequest):
-    result = answer(request.query, collection, conn)
+    result = answer(request.query, collection, conn, model=request.model or DEFAULT_MODEL)
     return result
 
 
 @app.post("/query/stream")
 def query_stream(request: QueryRequest):
+    model = request.model or DEFAULT_MODEL
+
     def generate():
-        for event in stream_answer(request.query, collection, conn):
+        for event in stream_answer(request.query, collection, conn, model=model):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -176,3 +192,21 @@ def benchmark_run(request: BenchmarkRequest):
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+class ContextRequest(BaseModel):
+    model: str
+    query: str
+    n_results: int
+
+
+@app.get("/benchmark/context/steps")
+def benchmark_context_steps():
+    """The N (retrieved-doc count) values the /eval context sweep steps through."""
+    return {"n_values": CONTEXT_N_VALUES}
+
+
+@app.post("/benchmark/context")
+def benchmark_context(request: ContextRequest):
+    """One point of the context-length curve: prefill/latency for a given N."""
+    return context_run(request.model, request.query, request.n_results, collection, conn)
