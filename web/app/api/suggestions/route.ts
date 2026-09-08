@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { BACKEND_URL } from "@/lib/backend";
 
-export const dynamic = "force-dynamic"; // never cache; suggestions are randomised per request
+// Never cache: the backend itself now rotates its picks every few days (not
+// per request), so always ask it fresh rather than caching a stale answer.
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {

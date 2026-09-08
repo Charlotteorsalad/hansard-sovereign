@@ -12,7 +12,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { PanelLeftClose, PanelLeftOpen, PenLine, X, ArrowUp, Landmark, User, Gauge } from "lucide-react";
+import { PanelLeftClose, PanelLeftOpen, PenLine, X, ArrowUp, Square, Landmark, User, Gauge, Columns2 } from "lucide-react";
 
 interface Source {
   index: number;
@@ -34,12 +34,33 @@ interface Chat {
   title: string;
   messages: Message[];
   createdAt: number;
+  // Present on saved "Compare:" entries — query, both answers, shared sources.
+  compare?: {
+    query: string;
+    a: string;
+    aMs: number;
+    b: string;
+    bMs: number;
+    sources: Source[];
+  };
 }
 
 // A real speaker line is short ("Tuan Khoo Poay Tiong [Kota Melaka]"). Some
 // rows have a malformed speaker_raw where the whole speech leaked into the
 // field (extraction bug); cap it so the card can't balloon.
 const MAX_NAME_LEN = 60;
+
+// One side of the compare view.
+type CmpPanel = {
+  text: string;
+  status: "idle" | "waiting" | "streaming" | "done";
+  start: number; // performance.now() when it began streaming
+  ms: number; // final elapsed once done
+};
+const IDLE_CMP: CmpPanel = { text: "", status: "idle", start: 0, ms: 0 };
+// Both compare columns share one retrieval, so their [n] citations anchor to a
+// single shared source list under this msgIdx (kept clear of real message ids).
+const CMP_SRC_MID = -100;
 
 function parseSource(speaker: string) {
   const clean = speaker.replace(/\n/g, " ").trim();
@@ -323,21 +344,40 @@ function LoadingDots() {
   );
 }
 
-// Fallback shown only if the backend /suggestions call fails; the live values
-// are fetched on mount and reflect real topics, members and dates in the corpus.
+// Fallback shown only if the backend /suggestions call fails (e.g. still
+// loading on startup) — deliberately generic, naming no member or date, since
+// there is no way to verify those against the corpus without the backend. The
+// live values are fetched on mount and reflect real topics, members and dates
+// in the corpus, rotating every few days rather than being fixed like this.
 const FALLBACK_SUGGESTIONS = [
   "What did members say about fuel subsidies?",
   "Any issues raised about public transport?",
-  "What topics were debated in March 2024?",
-  "What did Anwar Ibrahim say in parliament?",
+  "What was discussed about healthcare?",
+  "What topics were debated in parliament?",
 ];
 
 const STORAGE_KEY = "hansard_chats";
 
+// Chat titles are auto-generated from the query. A hard character cut lands
+// mid-word ("...Ahli Parlimen (MP) meng") with no visual cue it's truncated;
+// break at the last whole word instead and append an ellipsis when it is.
+function truncateTitle(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const lastSpace = cut.lastIndexOf(" ");
+  return (lastSpace > max * 0.5 ? cut.slice(0, lastSpace) : cut).trimEnd() + "…";
+}
+
 function loadChats(): Chat[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    if (!raw) return [];
+    const stored: Chat[] = JSON.parse(raw);
+    // One-time cleanup: drop empty "New chat" entries left over from before
+    // newChat() stopped saving a chat before it had any content.
+    const cleaned = stored.filter((c) => c.compare || c.messages.length > 0);
+    if (cleaned.length !== stored.length) saveChats(cleaned);
+    return cleaned;
   } catch {
     return [];
   }
@@ -345,6 +385,26 @@ function loadChats(): Chat[] {
 
 function saveChats(chats: Chat[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(chats));
+}
+
+// Which screen was showing (a specific chat, compare mode, or the blank "new
+// chat" state) — persisted separately from the chat list so a refresh lands
+// back on the same view instead of always jumping to the most recent chat.
+const ACTIVE_VIEW_KEY = "hansard_active_view";
+
+type ActiveView = { activeChatId: string | null; compareMode: boolean };
+
+function loadActiveView(): ActiveView | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_VIEW_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveActiveView(view: ActiveView) {
+  localStorage.setItem(ACTIVE_VIEW_KEY, JSON.stringify(view));
 }
 
 function ChatItem({
@@ -412,7 +472,26 @@ export default function Home() {
   const [showAllOpen, setShowAllOpen] = useState(false);
   const [panelExpanded, setPanelExpanded] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>(FALLBACK_SUGGESTIONS);
+  // Which model answers: the production 8B or the QLoRA fine-tuned 1.5B.
+  const [model, setModel] = useState("llama3.1:8b-instruct-q4_K_M");
+  // Compare mode: one question, both models answer side by side (AI-Studio style).
+  const [compareMode, setCompareMode] = useState(false);
+  const [cmpQuery, setCmpQuery] = useState("");
+  const [comparing, setComparing] = useState(false);
+  const [cmpNow, setCmpNow] = useState(0); // ticks while comparing, for the live timer
+  const [cmpA, setCmpA] = useState<CmpPanel>(IDLE_CMP); // 8B
+  const [cmpB, setCmpB] = useState<CmpPanel>(IDLE_CMP); // fine-tune
+  const [cmpSources, setCmpSources] = useState<Source[]>([]); // shared retrieval
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Latest chats, readable inside async stream handlers without capturing a
+  // stale closure (so a chat deleted mid-stream isn't resurrected on save).
+  const chatsRef = useRef<Chat[]>([]);
+  useEffect(() => { chatsRef.current = chats; }, [chats]);
+  // The in-flight stream, so a new action or leaving the page can cancel it —
+  // the 4 GB GPU serves one generation at a time, and an orphaned request keeps
+  // Ollama busy and the UI stuck.
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   const CHAT_LIMIT = 18;
 
@@ -424,11 +503,29 @@ export default function Home() {
   useEffect(() => {
     const stored = loadChats();
     setChats(stored);
-    if (stored.length > 0) setActiveChatId(stored[0].id);
+
+    const savedView = loadActiveView();
+    // Restore the exact screen from last time — including "new chat" (a null
+    // id) — rather than always defaulting to the most recent chat. Only trust
+    // a saved chat id if that chat still exists (it may have been deleted).
+    if (savedView && (savedView.activeChatId === null ||
+        stored.some((c) => c.id === savedView.activeChatId))) {
+      setActiveChatId(savedView.activeChatId);
+      setCompareMode(savedView.compareMode);
+    } else if (stored.length > 0) {
+      setActiveChatId(stored[0].id);
+    }
   }, []);
 
+  // Keep the persisted view in sync so a refresh returns to the same screen.
   useEffect(() => {
-    // Pull fresh, data-grounded prompts each load; keep the fallback on failure.
+    saveActiveView({ activeChatId, compareMode });
+  }, [activeChatId, compareMode]);
+
+  // Pull fresh, data-grounded prompts; keep the fallback on failure. Called on
+  // first load and again each time newChat() starts a fresh round, so the
+  // suggestions rotate per new chat rather than on a fixed schedule.
+  function fetchSuggestions() {
     fetch("/api/suggestions")
       .then((res) => res.json())
       .then((data) => {
@@ -437,6 +534,10 @@ export default function Home() {
         }
       })
       .catch(() => {});
+  }
+
+  useEffect(() => {
+    fetchSuggestions();
   }, []);
 
   useEffect(() => {
@@ -450,21 +551,42 @@ export default function Home() {
 
   const activeChat = chats.find((c) => c.id === activeChatId) ?? null;
 
+  // The retrieved speeches a compare answer cites (both columns draw from the
+  // same shared retrieval, so indices are consistent across them).
+  function citedSources(text: string): Source[] {
+    const cited = new Set<number>();
+    for (const mm of text.matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) {
+      for (const n of mm[1].split(",")) cited.add(parseInt(n.trim(), 10));
+    }
+    return cmpSources.filter((s) => cited.has(s.index));
+  }
+
+  // One shared source list for the compare view: the union of what either
+  // answer cited, in retrieval order (both columns' [n] point here).
+  const cmpCitedIdx = new Set(
+    [...citedSources(cmpA.text), ...citedSources(cmpB.text)].map((s) => s.index)
+  );
+  const cmpCited = cmpSources.filter((s) => cmpCitedIdx.has(s.index));
+
   function newChat() {
-    const chat: Chat = {
-      id: Date.now().toString(),
-      title: "New chat",
-      messages: [],
-      createdAt: Date.now(),
-    };
-    const updated = [chat, ...chats];
-    setChats(updated);
-    saveChats(updated);
-    setActiveChatId(chat.id);
+    // Don't create/save a chat entry yet — an empty "New chat" in the sidebar
+    // with nothing in it is clutter. handleSend() creates the real entry
+    // lazily on the first message (see its `!currentChatId` branch below).
+    setActiveChatId(null);
+    setCompareMode(false);
+    fetchSuggestions(); // a fresh set of prompts for this new round
   }
 
   function deleteChat(id: string) {
-    const updated = chats.filter((c) => c.id !== id);
+    // If the chat being deleted is the one currently streaming, cancel the
+    // stream so its completion can't write the deleted chat back to storage.
+    if (streamingChatId === id) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setLoading(false);
+      setStreamingChatId(null);
+    }
+    const updated = chatsRef.current.filter((c) => c.id !== id);
     setChats(updated);
     saveChats(updated);
     if (activeChatId === id) {
@@ -487,22 +609,171 @@ export default function Home() {
     setRenamingId(null);
   }
 
+  // Tick a clock while comparing so each panel can show a live elapsed timer.
+  useEffect(() => {
+    if (!comparing) return;
+    const id = setInterval(() => setCmpNow(performance.now()), 100);
+    return () => clearInterval(id);
+  }, [comparing]);
+
+  // Stream one model's answer into a compare panel; resolves with its result.
+  async function streamCompare(
+    m: string,
+    query: string,
+    setBuf: React.Dispatch<React.SetStateAction<CmpPanel>>,
+    signal: AbortSignal,
+  ): Promise<{ text: string; ms: number; sources: Source[] }> {
+    const t0 = performance.now();
+    setBuf((p) => ({ ...p, text: "", status: "streaming", start: t0, ms: 0 }));
+    const res = await fetch("/api/query/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, model: m }),
+      signal,
+    });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let acc = "";
+    let out = { text: "", ms: 0, sources: [] as Source[] };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const e = JSON.parse(line.slice(6));
+        if (e.type === "token") {
+          acc += e.text;
+          setBuf((p) => ({ ...p, text: acc }));
+        } else if (e.type === "done") {
+          out = { text: e.answer ?? acc, ms: Math.round(performance.now() - t0),
+            sources: e.sources ?? [] };
+          setBuf((p) => ({ ...p, text: out.text, status: "done", ms: out.ms }));
+        }
+      }
+    }
+    return out;
+  }
+
+  // Load a saved "compare:" entry back into the compare view.
+  function openCompareChat(chat: Chat) {
+    if (!chat.compare) return;
+    setCmpQuery(chat.compare.query);
+    setCmpA({ text: chat.compare.a, status: "done", start: 0, ms: chat.compare.aMs });
+    setCmpB({ text: chat.compare.b, status: "done", start: 0, ms: chat.compare.bMs });
+    setCmpSources(chat.compare.sources ?? []);
+    setCompareMode(true);
+  }
+
+  // Select a sidebar entry: a compare entry reopens the comparison; a normal
+  // chat leaves compare mode.
+  function selectChat(chat: Chat) {
+    setActiveChatId(chat.id);
+    if (chat.compare) openCompareChat(chat);
+    else setCompareMode(false);
+  }
+
+  async function handleCompare(overrideQuery?: string) {
+    const query = (overrideQuery ?? input).trim();
+    if (!query || comparing) return;
+    // Cancel any in-flight stream; only one generation runs on the GPU at once.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setCmpQuery(query);
+    setInput("");
+    setComparing(true);
+    setCmpA({ ...IDLE_CMP });
+    // The 4 GB GPU can't hold both models at once, so the fine-tune waits for
+    // the 8B to finish rather than both loading and thrashing.
+    setCmpB({ ...IDLE_CMP, status: "waiting" });
+    const a = await streamCompare("llama3.1:8b-instruct-q4_K_M", query, setCmpA, controller.signal)
+      .catch(() => {
+        setCmpA((p) => ({ ...p, status: "done" }));
+        return { text: "", ms: 0, sources: [] as Source[] };
+      });
+    // Aborted between the two runs (navigation / a newer action): stop here and
+    // don't start the second model or save a half comparison.
+    if (controller.signal.aborted) {
+      if (abortRef.current === controller) { abortRef.current = null; setComparing(false); }
+      return;
+    }
+    const b = await streamCompare("hansard-qwen", query, setCmpB, controller.signal)
+      .catch(() => {
+        setCmpB((p) => ({ ...p, status: "done" }));
+        return { text: "", ms: 0, sources: [] as Source[] };
+      });
+    // A newer action superseded this comparison while it ran — drop the result.
+    if (abortRef.current !== controller) return;
+    abortRef.current = null;
+    setComparing(false);
+    // Both models summarise the same retrieval, so keep one shared source set.
+    const sources = a.sources.length ? a.sources : b.sources;
+    setCmpSources(sources);
+    // Save the comparison to the sidebar with a "Compare:" prefix.
+    const chat: Chat = {
+      id: Date.now().toString(),
+      title: `Compare: ${truncateTitle(query, 42)}`,
+      messages: [],
+      createdAt: Date.now(),
+      compare: { query, a: a.text, aMs: a.ms, b: b.text, bMs: b.ms, sources },
+    };
+    const updated = [chat, ...chatsRef.current];
+    setChats(updated);
+    saveChats(updated);
+    setActiveChatId(chat.id);
+  }
+
+  // Append an assistant message to a chat, reading and writing the LATEST
+  // chats so a stream that finishes after the user deleted its chat, or
+  // switched away, still lands in the right place (or is dropped if gone).
+  function appendAssistant(chatId: string, msg: Message) {
+    const base = chatsRef.current;
+    if (!base.some((c) => c.id === chatId)) return; // chat was deleted mid-stream
+    const finalChats = base.map((c) =>
+      c.id === chatId ? { ...c, messages: [...c.messages, msg] } : c
+    );
+    setChats(finalChats);
+    saveChats(finalChats);
+  }
+
+  // Interrupt whatever is running (a chat stream or a compare) and hand the
+  // input back to the user — the escape hatch when a run feels stuck.
+  function stopStream() {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+    setStreamingChatId(null);
+    setStreamingContent("");
+    setComparing(false);
+    setCmpA((p) => (p.status === "streaming" ? { ...p, status: "done" } : p));
+    setCmpB((p) => (p.status === "streaming" || p.status === "waiting" ? { ...p, status: "done" } : p));
+  }
+
   async function handleSend(overrideQuery?: string) {
     const query = (overrideQuery ?? input).trim();
     if (!query || loading) return;
+    // Cancel any in-flight stream before starting a new one — one generation
+    // at a time on the GPU, and no orphaned request left holding Ollama.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setInput("");
 
     let currentChatId = activeChatId;
-    let currentChats = chats;
+    let currentChats = chatsRef.current;
 
     if (!currentChatId) {
       const chat: Chat = {
         id: Date.now().toString(),
-        title: query.slice(0, 40),
+        title: truncateTitle(query, 40),
         messages: [],
         createdAt: Date.now(),
       };
-      currentChats = [chat, ...chats];
+      currentChats = [chat, ...currentChats];
       setChats(currentChats);
       saveChats(currentChats);
       setActiveChatId(chat.id);
@@ -514,7 +785,7 @@ export default function Home() {
       c.id === currentChatId
         ? {
             ...c,
-            title: c.messages.length === 0 ? query.slice(0, 40) : c.title,
+            title: c.messages.length === 0 ? truncateTitle(query, 40) : c.title,
             messages: [...c.messages, userMsg],
           }
         : c
@@ -529,7 +800,8 @@ export default function Home() {
       const res = await fetch("/api/query/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, model }),
+        signal: controller.signal,
       });
 
       const reader = res.body!.getReader();
@@ -551,38 +823,32 @@ export default function Home() {
             accumulated += event.text;
             setStreamingContent(accumulated);
           } else if (event.type === "done") {
-            const assistantMsg: Message = {
+            appendAssistant(currentChatId, {
               role: "assistant",
               content: event.answer,
               sources: event.sources,
-            };
-            const finalChats = updatedChats.map((c) =>
-              c.id === currentChatId
-                ? { ...c, messages: [...c.messages, assistantMsg] }
-                : c
-            );
-            setChats(finalChats);
-            saveChats(finalChats);
-            setStreamingContent("");
+            });
           }
         }
       }
     } catch {
-      const errorMsg: Message = {
-        role: "assistant",
-        content: "Something went wrong. Please try again.",
-      };
-      const finalChats = updatedChats.map((c) =>
-        c.id === currentChatId
-          ? { ...c, messages: [...c.messages, errorMsg] }
-          : c
-      );
-      setChats(finalChats);
-      saveChats(finalChats);
-      setStreamingContent("");
+      // An aborted stream (navigation, delete, a newer send) is intentional —
+      // don't record it as an error.
+      if (!controller.signal.aborted) {
+        appendAssistant(currentChatId, {
+          role: "assistant",
+          content: "Something went wrong. Please try again.",
+        });
+      }
     } finally {
-      setLoading(false);
-      setStreamingChatId(null);
+      // Only the still-current stream clears the shared UI flags; an aborted
+      // predecessor must not reset the successor's loading state.
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setLoading(false);
+        setStreamingChatId(null);
+        setStreamingContent("");
+      }
     }
   }
 
@@ -636,7 +902,9 @@ export default function Home() {
                   renamingId={renamingId}
                   renameValue={renameValue}
                   setRenameValue={setRenameValue}
-                  onSelect={() => renamingId !== chat.id && setActiveChatId(chat.id)}
+                  onSelect={() => {
+                    if (renamingId !== chat.id) selectChat(chat);
+                  }}
                   onStartRename={() => startRename(chat)}
                   onCommitRename={() => commitRename(chat.id)}
                   onCancelRename={() => setRenamingId(null)}
@@ -701,7 +969,7 @@ export default function Home() {
                 {(panelExpanded ? chats.slice(CHAT_LIMIT) : chats.slice(CHAT_LIMIT, CHAT_LIMIT * 2)).map((chat) => (
                   <button
                     key={chat.id}
-                    onClick={() => { setActiveChatId(chat.id); closePanel(); }}
+                    onClick={() => { selectChat(chat); closePanel(); }}
                     className={`w-full text-left px-5 py-3 border-b border-white/[0.05] last:border-0 transition-colors hover:bg-white/[0.05] ${
                       activeChatId === chat.id ? "bg-white/[0.08]" : ""
                     }`}
@@ -745,10 +1013,150 @@ export default function Home() {
             <span className="text-base font-medium text-gray-700 truncate">
               {activeChat ? activeChat.title : "Hansard Sovereign"}
             </span>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                onClick={() => {
+                  if (compareMode) {
+                    setCompareMode(false);
+                    if (activeChat?.compare) {
+                      const normal = chats.find((c) => !c.compare);
+                      setActiveChatId(normal ? normal.id : null);
+                    }
+                  } else {
+                    setCmpQuery("");
+                    setCmpA(IDLE_CMP);
+                    setCmpB(IDLE_CMP);
+                    setCmpSources([]);
+                    setActiveChatId(null);
+                    setCompareMode(true);
+                  }
+                }}
+                disabled={loading || comparing}
+                className={`flex items-center gap-1.5 h-8 rounded-lg border px-2.5 text-xs transition-colors disabled:opacity-50 cursor-pointer ${
+                  compareMode
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-gray-300 text-gray-500 hover:bg-gray-100"
+                }`}
+              >
+                <Columns2 className="h-3.5 w-3.5" />
+                Compare
+              </button>
+              {!compareMode && (
+                <label className="flex items-center gap-1.5 text-xs text-gray-500">
+                  Model
+                  <select
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    disabled={loading}
+                    className="h-8 rounded-lg border border-gray-300 bg-white px-2 text-gray-800 outline-none focus:border-primary disabled:opacity-50"
+                  >
+                    <option value="llama3.1:8b-instruct-q4_K_M">Llama 8B · quality</option>
+                    <option value="hansard-qwen">★ Fine-tuned 1.5B · fast</option>
+                  </select>
+                </label>
+              )}
+            </div>
           </header>
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto">
+            {compareMode ? (
+            <div className="max-w-6xl mx-auto px-4 py-8">
+              {!cmpQuery ? (
+                <div className="flex flex-col items-center justify-center min-h-[55vh] text-center">
+                  <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-5">
+                    <Columns2 className="h-7 w-7 text-primary" />
+                  </div>
+                  <h1 className="text-xl font-semibold text-gray-800 mb-1">Compare models</h1>
+                  <p className="text-sm text-gray-400 max-w-sm">
+                    Ask one question — the production 8B and your fine-tuned 1.5B
+                    answer side by side.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="mb-6 flex justify-center">
+                    <div className="bg-primary text-primary-foreground rounded-2xl rounded-tr-sm px-4 py-2.5 text-base max-w-2xl">
+                      {cmpQuery}
+                    </div>
+                  </div>
+                  <div className="grid items-start gap-4 md:grid-cols-2">
+                    {([
+                      { label: "Llama 8B", tag: "quality", buf: cmpA, prod: false },
+                      { label: "Fine-tuned 1.5B", tag: "fast", buf: cmpB, prod: true },
+                    ] as const).map((col) => {
+                      const secs =
+                        col.buf.status === "done"
+                          ? col.buf.ms / 1000
+                          : col.buf.status === "streaming"
+                            ? Math.max(0, (cmpNow - col.buf.start) / 1000)
+                            : null;
+                      return (
+                        <div key={col.label} className="flex flex-col">
+                          <div className="mb-2 flex items-center justify-between px-1">
+                            <span className={`flex items-center gap-1 text-sm font-medium ${col.prod ? "text-primary" : "text-gray-700"}`}>
+                              {col.prod && "★ "}
+                              {col.label}
+                              <span className="text-xs font-normal text-gray-400">· {col.tag}</span>
+                            </span>
+                            <span className="text-xs tabular-nums text-gray-400">
+                              {secs !== null
+                                ? `${col.buf.status === "done" ? "✓ " : ""}${secs.toFixed(1)}s`
+                                : col.buf.status === "waiting"
+                                  ? "waiting"
+                                  : ""}
+                            </span>
+                          </div>
+                          <Card className="border border-gray-100 shadow-sm">
+                            <CardContent className="px-5 py-4">
+                              {col.buf.status === "waiting" ? (
+                                <p className="text-sm leading-relaxed text-gray-400">
+                                  Waiting — the 4&nbsp;GB GPU can&apos;t hold both models
+                                  at once, so this runs after Llama&nbsp;8B finishes.
+                                </p>
+                              ) : col.buf.text ? (
+                                <MarkdownMessage
+                                  text={col.buf.text}
+                                  msgIdx={CMP_SRC_MID}
+                                  displayMap={new Map()}
+                                  cursor={col.buf.status === "streaming"}
+                                />
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <div className="avatar-thinking flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-blue-600">
+                                    <Landmark className="h-3.5 w-3.5 text-white" />
+                                  </div>
+                                  <LoadingDots />
+                                </div>
+                              )}
+                            </CardContent>
+                          </Card>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Both columns summarise the same retrieval, so their [n]
+                      resolve to one shared source list (the union of what either
+                      answer cited) instead of two duplicated columns. */}
+                  {cmpCited.length > 0 && (
+                    <div className="mt-4">
+                      <p className="mb-2 ml-1 text-xs text-gray-400">Sources</p>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        {cmpCited.map((s) => (
+                          <SourceCard
+                            key={s.index}
+                            source={s}
+                            id={`source-${CMP_SRC_MID}-${s.index}`}
+                            displayIndex={s.index}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            ) : (
             <div className="max-w-3xl mx-auto px-4 py-8 space-y-8">
               {!activeChat || activeChat.messages.length === 0 ? (
                 /* Empty state */
@@ -869,6 +1277,7 @@ export default function Home() {
 
               <div ref={bottomRef} />
             </div>
+            )}
           </div>
 
           {/* Input */}
@@ -883,20 +1292,35 @@ export default function Home() {
               >
                 <input
                   className="flex-1 text-base outline-none bg-transparent placeholder:text-gray-400 text-gray-800 disabled:cursor-not-allowed"
-                  placeholder="Ask about Malaysian Parliament debates…"
+                  placeholder={compareMode
+                    ? "Ask once — both models answer…"
+                    : "Ask about Malaysian Parliament debates…"}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleSend()}
-                  disabled={loading}
+                  onKeyDown={(e) =>
+                    e.key === "Enter" && !e.shiftKey &&
+                    (compareMode ? handleCompare() : handleSend())}
+                  disabled={loading || comparing}
                 />
-                <Button
-                  size="icon"
-                  onClick={() => handleSend()}
-                  disabled={loading || !input.trim()}
-                  className="h-8 w-8 rounded-xl disabled:bg-gray-100 disabled:text-gray-300 flex-shrink-0"
-                >
-                  <ArrowUp className="h-4 w-4" />
-                </Button>
+                {loading || comparing ? (
+                  <Button
+                    size="icon"
+                    onClick={stopStream}
+                    title="Stop"
+                    className="h-8 w-8 rounded-xl flex-shrink-0"
+                  >
+                    <Square className="h-3.5 w-3.5 fill-current" />
+                  </Button>
+                ) : (
+                  <Button
+                    size="icon"
+                    onClick={() => (compareMode ? handleCompare() : handleSend())}
+                    disabled={!input.trim()}
+                    className="h-8 w-8 rounded-xl disabled:bg-gray-100 disabled:text-gray-300 flex-shrink-0"
+                  >
+                    <ArrowUp className="h-4 w-4" />
+                  </Button>
+                )}
               </div>
               <p className="text-center text-xs text-gray-400 mt-2">
                 Grounded on Hansard PDFs · Local LLM · On-premise

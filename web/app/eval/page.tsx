@@ -37,6 +37,18 @@ type Live = {
 
 type Result = Live & { model: string; query: string };
 
+// One point on the context-length curve (a single N).
+type CtxPoint = {
+  n_results: number;
+  prompt_tokens: number;
+  prefill_ms: number;
+  total_time_ms: number;
+  gen_tokens: number;
+  peak_vram_mb: number;
+  done: boolean;
+};
+const CTX_N = [3, 5, 10, 20, 30, 50];
+
 // The production RAG model, featured throughout so the page centres on it
 // rather than on whatever happens to be fastest.
 const PRODUCTION_MODEL = "llama3.1:8b-instruct-q4_K_M";
@@ -173,6 +185,54 @@ function CompareRow({
   );
 }
 
+// One row of the context-length sweep: a prefill-latency bar for a given N.
+function CtxRow({
+  point,
+  maxPrefill,
+  active,
+}: {
+  point: CtxPoint;
+  maxPrefill: number;
+  active: boolean;
+}) {
+  const pct = maxPrefill ? Math.max((point.prefill_ms / maxPrefill) * 100, 2) : 2;
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="font-medium tabular-nums text-slate-900">
+            N = {point.n_results}
+          </span>
+          {point.done && (
+            <span className="text-xs text-slate-400">{fmt(point.prompt_tokens)} tok</span>
+          )}
+          {active && !point.done && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+          )}
+        </div>
+        <div className="text-right">
+          <span className="text-lg font-semibold tabular-nums text-slate-900">
+            {point.done ? fmt(Math.round(point.prefill_ms)) : "—"}
+          </span>
+          <span className="ml-1 text-xs text-slate-400">ms prefill</span>
+        </div>
+      </div>
+      <div className="mt-2 h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div
+          className="h-full rounded-full bg-[#c0504d] transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {point.done && (
+        <div className="mt-2 flex flex-wrap gap-x-4 text-xs text-slate-500">
+          <span>total {fmt(Math.round(point.total_time_ms))} ms</span>
+          <span>VRAM {fmt(point.peak_vram_mb)} MB</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function EvalPage() {
   const [info, setInfo] = useState<Info | null>(null);
   const [offline, setOffline] = useState(false);
@@ -189,6 +249,13 @@ export default function EvalPage() {
   // Comparison mode: same query across every installed model, sequentially.
   const [compare, setCompare] = useState<Record<string, Live>>({});
   const [compareCurrent, setCompareCurrent] = useState<string | null>(null);
+
+  // Context-length sweep (second tab).
+  const [tab, setTab] = useState<"models" | "context">("models");
+  const [ctxModel, setCtxModel] = useState("");
+  const [ctx, setCtx] = useState<Record<number, CtxPoint>>({});
+  const [ctxCurrent, setCtxCurrent] = useState<number | null>(null);
+
   const textBoxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -201,6 +268,7 @@ export default function EvalPage() {
           data.models[0]?.name ??
           "";
         setModel(def);
+        setCtxModel(def); // focus on the production model in both tabs
         setPresetQuery(data.queries[0] ?? "");
       })
       .catch(() => setOffline(true));
@@ -210,7 +278,7 @@ export default function EvalPage() {
     textBoxRef.current?.scrollTo({ top: textBoxRef.current.scrollHeight });
   }, [text]);
 
-  const busy = running || compareCurrent !== null;
+  const busy = running || compareCurrent !== null || ctxCurrent !== null;
 
   async function run() {
     if (!model || !query || busy) return;
@@ -272,12 +340,46 @@ export default function EvalPage() {
     setCompareCurrent(null);
   }
 
+  async function runContextSweep() {
+    if (!ctxModel || !query || busy) return;
+    setError("");
+    // Seed all N up front so the chart shows the axis before anything runs.
+    const seeded: Record<number, CtxPoint> = {};
+    for (const n of CTX_N) {
+      seeded[n] = { n_results: n, prompt_tokens: 0, prefill_ms: 0,
+        total_time_ms: 0, gen_tokens: 0, peak_vram_mb: 0, done: false };
+    }
+    setCtx(seeded);
+
+    for (const n of CTX_N) {
+      setCtxCurrent(n);
+      try {
+        const res = await fetch("/api/benchmark/context", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: ctxModel, query, n_results: n }),
+        });
+        const d = (await res.json()) as CtxPoint;
+        setCtx((prev) => ({ ...prev, [n]: { ...d, done: true } }));
+      } catch {
+        setError(`Context run failed at N=${n}.`);
+      }
+    }
+    setCtxCurrent(null);
+  }
+
   const compareModels = info?.models.map((m) => m.name) ?? [];
   const maxTps = Math.max(
     1,
     ...Object.values(compare).map((d) => d.tokens_per_sec),
   );
   const hasCompare = Object.keys(compare).length > 0;
+  const hasCtx = Object.keys(ctx).length > 0;
+  const maxPrefill = Math.max(1, ...Object.values(ctx).map((d) => d.prefill_ms));
+  // Production model (llama) first in the dropdowns — it's the focus of the page.
+  const orderedModels = info
+    ? [...info.models].sort((a, b) => Number(isProd(b.name)) - Number(isProd(a.name)))
+    : [];
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -303,7 +405,8 @@ export default function EvalPage() {
           {info && (
             <Badge variant="secondary" className="gap-1.5">
               <Cpu className="h-3.5 w-3.5" />
-              {info.hardware.gpu} · {fmt(info.hardware.vram_mb)} MB VRAM
+              {info.hardware.gpu}
+              {info.hardware.vram_mb > 0 && ` · ${fmt(info.hardware.vram_mb)} MB VRAM`}
             </Badge>
           )}
           <h1 className="text-3xl font-bold tracking-tight text-slate-900">
@@ -330,8 +433,26 @@ export default function EvalPage() {
           </Card>
         ) : (
           <>
+            {/* Tabs */}
+            <div className="mt-8 flex w-fit gap-1 rounded-lg border border-slate-200 bg-white p-1">
+              {(["models", "context"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  disabled={busy}
+                  className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 ${
+                    tab === t ? "bg-navy text-white" : "text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  {t === "models" ? "Model comparison" : "Context length"}
+                </button>
+              ))}
+            </div>
+
+            {tab === "models" && (
+            <>
             {/* Controls */}
-            <Card className="mt-8 border-slate-200">
+            <Card className="mt-6 border-slate-200">
               <CardContent className="space-y-4 py-5">
                 <div className="grid gap-4 sm:grid-cols-2">
                   <label className="flex flex-col gap-1.5 text-sm">
@@ -342,7 +463,7 @@ export default function EvalPage() {
                       disabled={busy || !info}
                       className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-slate-900 outline-none focus:border-blue-500 disabled:opacity-50"
                     >
-                      {info?.models.map((m) => (
+                      {orderedModels.map((m) => (
                         <option key={m.name} value={m.name}>
                           {isProd(m.name) ? "★ " : ""}
                           {m.name} ({fmt(m.size_mb)} MB)
@@ -546,6 +667,104 @@ export default function EvalPage() {
               <code>results/quantization_benchmark.csv</code>; full write-up in{" "}
               <code>docs/quantization_benchmark.md</code>.
             </p>
+            </>
+            )}
+
+            {tab === "context" && (
+              <>
+                <Card className="mt-6 border-slate-200">
+                  <CardContent className="space-y-4 py-5">
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <label className="flex flex-col gap-1.5 text-sm">
+                        <span className="text-slate-500">Model</span>
+                        <select
+                          value={ctxModel}
+                          onChange={(e) => setCtxModel(e.target.value)}
+                          disabled={busy || !info}
+                          className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-slate-900 outline-none focus:border-blue-500 disabled:opacity-50"
+                        >
+                          {orderedModels.map((m) => (
+                            <option key={m.name} value={m.name}>
+                              {isProd(m.name) ? "★ " : ""}
+                              {m.name} ({fmt(m.size_mb)} MB)
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1.5 text-sm">
+                        <span className="text-slate-500">Query</span>
+                        <select
+                          value={presetQuery}
+                          onChange={(e) => setPresetQuery(e.target.value)}
+                          disabled={busy || !info}
+                          className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-slate-900 outline-none focus:border-blue-500 disabled:opacity-50"
+                        >
+                          {info?.queries.map((q) => (
+                            <option key={q} value={q}>
+                              {q}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <input
+                      value={customQuery}
+                      onChange={(e) => setCustomQuery(e.target.value)}
+                      disabled={busy || !info}
+                      placeholder="…or type your own query (overrides the dropdown)"
+                      className="h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-blue-500 disabled:opacity-50"
+                    />
+                    <div className="flex justify-center">
+                      <Button onClick={runContextSweep} disabled={busy || !info} className="gap-1.5">
+                        {ctxCurrent ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Layers className="h-4 w-4" />
+                        )}
+                        {ctxCurrent ? `Running N=${ctxCurrent}…` : "Run sweep (N = 3…50)"}
+                      </Button>
+                    </div>
+                    <p className="text-center text-xs text-slate-500">
+                      Same query, more retrieved speeches → longer prompt. Measures how
+                      prefill (TTFT) scales with context. The production 8B spills to CPU,
+                      so its sweep is slow — pick a smaller model above for a quick run.
+                    </p>
+                  </CardContent>
+                </Card>
+
+                {hasCtx && (
+                  <section className="mt-6">
+                    <h3 className="text-lg font-semibold text-slate-900">
+                      Prefill latency vs context length
+                    </h3>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Bar length = prefill time. It grows super-linearly with prompt
+                      length as attention&apos;s O(n²) term kicks in.
+                    </p>
+                    <div className="mt-3 space-y-2">
+                      {CTX_N.map((n) => (
+                        <CtxRow
+                          key={n}
+                          point={ctx[n] ?? { n_results: n, prompt_tokens: 0, prefill_ms: 0,
+                            total_time_ms: 0, gen_tokens: 0, peak_vram_mb: 0, done: false }}
+                          maxPrefill={maxPrefill}
+                          active={ctxCurrent === n}
+                        />
+                      ))}
+                    </div>
+                    <p className="mt-4 text-xs text-slate-400">
+                      Peak VRAM stays ~flat across N — Ollama pre-sizes the KV cache to
+                      the context window, not the actual prompt. Full write-up in{" "}
+                      <code>docs/context_length_benchmark.md</code>.
+                    </p>
+                  </section>
+                )}
+              </>
+            )}
+
+            {error && tab === "context" && (
+              <p className="mt-3 text-sm text-red-600">{error}</p>
+            )}
           </>
         )}
       </main>
