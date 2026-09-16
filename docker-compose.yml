@@ -8,13 +8,21 @@
 # the host avoids NVIDIA-Container-Toolkit setup. The backend reaches it via
 # host.docker.internal. The data/ dir (sqlite + chroma) is mounted, not baked
 # into the image — populate it first with the ingest pipeline.
+#
+# WSL2 + Docker Desktop gotcha: host.docker.internal resolves to the Docker
+# Desktop VM's view of "host", which is NOT the same machine as a WSL distro
+# running Ollama as its own systemd service — the backend will reach an empty
+# Ollama (or none) and every generation 404s. If `docker compose logs backend`
+# shows "model '...' not found" despite `ollama list` showing it, override:
+#   OLLAMA_BASE_URL=http://$(hostname -I | awk '{print $1}'):11434 docker compose up --build
+# (that IP is only stable for the current WSL session — re-check after a reboot).
 services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile
     environment:
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       CUDA_VISIBLE_DEVICES: ""
     extra_hosts:
       - "host.docker.internal:host-gateway" # lets the container reach host Ollama on Linux

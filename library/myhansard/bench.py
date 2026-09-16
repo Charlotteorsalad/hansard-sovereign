@@ -4,6 +4,7 @@ web UI's real-time numbers. Talks to a local Ollama and a local nvidia-smi.
 """
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -21,20 +22,39 @@ from .rag import (
 
 OLLAMA_GENERATE = f"{OLLAMA_BASE_URL}/api/generate"
 OLLAMA_TAGS = f"{OLLAMA_BASE_URL}/api/tags"
+OLLAMA_PS = f"{OLLAMA_BASE_URL}/api/ps"
 
 # Fixed seed and temperature so we measure the engine, not sampling noise.
-GEN_OPTIONS = {"temperature": 0.3, "seed": 42}
+# num_predict caps how much each live run generates: TTFT is captured on the
+# very first token regardless, and decode tokens/sec stabilises well within
+# ~70 tokens, so a full multi-hundred-token answer adds wall-clock time (badly
+# on this hardware's CPU-spilling 8B/7B) without making either metric more
+# accurate — the same reasoning standard inference benchmarks (e.g. MLPerf)
+# use: measure throughput over a fixed generation length, not "however long
+# the model feels like talking." This does not make the run any less live —
+# every token is still generated fresh, right then, against the real model.
+GEN_OPTIONS = {"temperature": 0.3, "seed": 42, "num_predict": 70}
 
 
 def gpu_used_mb() -> int | None:
-    """Current GPU memory used (MiB), or None if nvidia-smi is unavailable."""
+    """VRAM currently used by Ollama's loaded model(s) (MiB), or None if it
+    can't be read.
+
+    Reads Ollama's own `/api/ps` (`size_vram`, bytes) rather than shelling out
+    to nvidia-smi: it's a plain HTTP call to the same Ollama this app already
+    depends on, so it works identically whether this runs natively on the GPU
+    host or in a container with no GPU device access at all — and it reports
+    what Ollama itself is using, not total system-wide VRAM (which would
+    include other processes and be a noisier number on a shared machine).
+    """
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return int(out.stdout.strip().splitlines()[0])
+        r = requests.get(OLLAMA_PS, timeout=2)
+        r.raise_for_status()
+        models = r.json().get("models", [])
+        if not models:
+            return None
+        total_bytes = sum(m.get("size_vram", 0) for m in models)
+        return round(total_bytes / (1024 * 1024))
     except Exception:
         return None
 
@@ -62,10 +82,17 @@ def gpu_info() -> dict:
 
 def processor_split(model: str) -> str:
     """Parse `ollama ps` PROCESSOR column for the loaded model (GPU/CPU split),
-    e.g. "100% GPU" or "58%/42% CPU/GPU"."""
+    e.g. "100% GPU" or "58%/42% CPU/GPU".
+
+    OLLAMA_HOST points the `ollama` CLI at the same server OLLAMA_BASE_URL
+    already talks to over HTTP — required when this runs in a container next
+    to a remote Ollama, since the CLI defaults to localhost otherwise.
+    """
     try:
         out = subprocess.run(
-            ["ollama", "ps"], capture_output=True, text=True, timeout=5
+            ["ollama", "ps"],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, "OLLAMA_HOST": OLLAMA_BASE_URL},
         ).stdout
     except Exception:
         return "unknown"
@@ -81,16 +108,21 @@ def processor_split(model: str) -> str:
 
 
 def list_models() -> list[dict]:
-    """Models installed in Ollama, via its HTTP API (name + size in MB)."""
+    """Models installed in Ollama, via its HTTP API — name, size, and the real
+    parameter count/quantization Ollama reports, so the UI never has to guess
+    or hard-code a model's size."""
     try:
         data = requests.get(OLLAMA_TAGS, timeout=5).json()
     except Exception:
         return []
     models = []
     for m in data.get("models", []):
+        details = m.get("details", {})
         models.append({
             "name": m["name"],
             "size_mb": round(m.get("size", 0) / (1024 * 1024)),
+            "parameter_size": details.get("parameter_size", ""),
+            "quantization": details.get("quantization_level", ""),
         })
     return sorted(models, key=lambda m: m["size_mb"])
 
@@ -189,9 +221,10 @@ def live_benchmark(model: str, query: str, collection, conn):
 # --------------------------------------------------------------------------- #
 # Context-length / KV-cache profiling: one (query, N) point
 # --------------------------------------------------------------------------- #
-# Big enough that even N=50 (~11.5k tokens) isn't truncated; output capped so
-# total time is dominated by prefill, not decode.
-CONTEXT_OPTIONS = {"temperature": 0.3, "seed": 42, "num_predict": 200,
+# num_ctx big enough that even N=50 (~11.5k tokens) isn't truncated;
+# num_predict kept short (same reasoning as GEN_OPTIONS above) so total time
+# stays dominated by prefill, not decode — that's the point of this sweep.
+CONTEXT_OPTIONS = {"temperature": 0.3, "seed": 42, "num_predict": 70,
                    "num_ctx": 12288}
 CONTEXT_N_VALUES = [3, 5, 10, 20, 30, 50]
 

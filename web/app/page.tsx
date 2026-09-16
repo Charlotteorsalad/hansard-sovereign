@@ -636,24 +636,33 @@ export default function Home() {
     let buffer = "";
     let acc = "";
     let out = { text: "", ms: 0, sources: [] as Source[] };
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const e = JSON.parse(line.slice(6));
-        if (e.type === "token") {
-          acc += e.text;
-          setBuf((p) => ({ ...p, text: acc }));
-        } else if (e.type === "done") {
-          out = { text: e.answer ?? acc, ms: Math.round(performance.now() - t0),
-            sources: e.sources ?? [] };
-          setBuf((p) => ({ ...p, text: out.text, status: "done", ms: out.ms }));
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const e = JSON.parse(line.slice(6));
+          if (e.type === "token") {
+            acc += e.text;
+            setBuf((p) => ({ ...p, text: acc }));
+          } else if (e.type === "done") {
+            out = { text: e.answer ?? acc, ms: Math.round(performance.now() - t0),
+              sources: e.sources ?? [] };
+            setBuf((p) => ({ ...p, text: out.text, status: "done", ms: out.ms }));
+          }
         }
       }
+    } catch (err) {
+      // Stopped mid-stream: keep whatever was generated so far instead of
+      // throwing it away — the caller still gets real (if partial) text.
+      if (signal.aborted) {
+        return { text: acc, ms: Math.round(performance.now() - t0), sources: [] };
+      }
+      throw err;
     }
     return out;
   }
@@ -695,25 +704,32 @@ export default function Home() {
         setCmpA((p) => ({ ...p, status: "done" }));
         return { text: "", ms: 0, sources: [] as Source[] };
       });
-    // Aborted between the two runs (navigation / a newer action): stop here and
-    // don't start the second model or save a half comparison.
-    if (controller.signal.aborted) {
-      if (abortRef.current === controller) { abortRef.current = null; setComparing(false); }
-      return;
-    }
-    const b = await streamCompare("hansard-qwen", query, setCmpB, controller.signal)
-      .catch(() => {
-        setCmpB((p) => ({ ...p, status: "done" }));
-        return { text: "", ms: 0, sources: [] as Source[] };
-      });
-    // A newer action superseded this comparison while it ran — drop the result.
+    // A newer action (navigation, delete, another send/compare) replaced this
+    // one entirely while A ran — its result is stale now, drop it silently.
     if (abortRef.current !== controller) return;
+
+    let b = { text: "", ms: 0, sources: [] as Source[] };
+    if (!controller.signal.aborted) {
+      b = await streamCompare("hansard-qwen", query, setCmpB, controller.signal)
+        .catch(() => {
+          setCmpB((p) => ({ ...p, status: "done" }));
+          return { text: "", ms: 0, sources: [] as Source[] };
+        });
+      // Same check again — a newer action could have superseded it during B.
+      if (abortRef.current !== controller) return;
+    } else {
+      // Stopped after A but before B started — B never ran.
+      setCmpB((p) => ({ ...p, status: "done" }));
+    }
+
     abortRef.current = null;
     setComparing(false);
     // Both models summarise the same retrieval, so keep one shared source set.
     const sources = a.sources.length ? a.sources : b.sources;
     setCmpSources(sources);
-    // Save the comparison to the sidebar with a "Compare:" prefix.
+    // Save the comparison to the sidebar with a "Compare:" prefix — even one
+    // stopped early, so the partial answer survives navigation/reload instead
+    // of only existing transiently in state.
     const chat: Chat = {
       id: Date.now().toString(),
       title: `Compare: ${truncateTitle(query, 42)}`,
@@ -742,12 +758,18 @@ export default function Home() {
 
   // Interrupt whatever is running (a chat stream or a compare) and hand the
   // input back to the user — the escape hatch when a run feels stuck.
+  //
+  // Deliberately does NOT null abortRef or touch chats/saveChats here — the
+  // in-flight handleSend/handleCompare call is still running (the fetch is
+  // aborted, but its catch/finally hasn't settled yet) and owns turning
+  // whatever was generated so far into a saved message/comparison, using
+  // `abortRef.current === controller` to tell "I'm still the current action"
+  // apart from "a newer action superseded me" — nulling abortRef here would
+  // make every stop look superseded and silently drop the partial output.
   function stopStream() {
     abortRef.current?.abort();
-    abortRef.current = null;
     setLoading(false);
     setStreamingChatId(null);
-    setStreamingContent("");
     setComparing(false);
     setCmpA((p) => (p.status === "streaming" ? { ...p, status: "done" } : p));
     setCmpB((p) => (p.status === "streaming" || p.status === "waiting" ? { ...p, status: "done" } : p));
@@ -796,6 +818,9 @@ export default function Home() {
     setStreamingChatId(currentChatId);
     setStreamingContent("");
 
+    // Declared outside the try so the catch block can still save whatever
+    // streamed in before a stop/abort, instead of losing it.
+    let accumulated = "";
     try {
       const res = await fetch("/api/query/stream", {
         method: "POST",
@@ -807,7 +832,6 @@ export default function Home() {
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let accumulated = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -832,9 +856,16 @@ export default function Home() {
         }
       }
     } catch {
-      // An aborted stream (navigation, delete, a newer send) is intentional —
-      // don't record it as an error.
-      if (!controller.signal.aborted) {
+      if (controller.signal.aborted) {
+        // Stopped mid-stream (or superseded by a newer send) — keep whatever
+        // was generated so far as a normal message instead of discarding it.
+        if (accumulated.trim()) {
+          appendAssistant(currentChatId, {
+            role: "assistant",
+            content: accumulated,
+          });
+        }
+      } else {
         appendAssistant(currentChatId, {
           role: "assistant",
           content: "Something went wrong. Please try again.",

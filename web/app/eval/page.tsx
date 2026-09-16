@@ -15,6 +15,7 @@ import {
   Hash,
   Star,
   Layers,
+  Square,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,8 +23,18 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 
 type Hardware = { gpu: string; vram_mb: number; driver: string };
-type ModelInfo = { name: string; size_mb: number };
-type Info = { hardware: Hardware; models: ModelInfo[]; queries: string[] };
+type ModelInfo = {
+  name: string;
+  size_mb: number;
+  parameter_size: string;
+  quantization: string;
+};
+type Info = {
+  hardware: Hardware;
+  models: ModelInfo[];
+  queries: string[];
+  production_model: string;
+};
 
 type Live = {
   ttft_ms: number | null;
@@ -49,11 +60,6 @@ type CtxPoint = {
 };
 const CTX_N = [3, 5, 10, 20, 30, 50];
 
-// The production RAG model, featured throughout so the page centres on it
-// rather than on whatever happens to be fastest.
-const PRODUCTION_MODEL = "llama3.1:8b-instruct-q4_K_M";
-const isProd = (name: string) => name === PRODUCTION_MODEL;
-
 const EMPTY: Live = {
   ttft_ms: null,
   tokens: 0,
@@ -72,11 +78,13 @@ async function streamRun(
   model: string,
   query: string,
   onEvent: (e: Record<string, unknown>) => void,
+  signal?: AbortSignal,
 ) {
   const res = await fetch("/api/benchmark/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, query }),
+    signal,
   });
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
@@ -131,13 +139,14 @@ function CompareRow({
   data,
   maxTps,
   active,
+  prod,
 }: {
   model: string;
   data: Live;
   maxTps: number;
   active: boolean;
+  prod: boolean;
 }) {
-  const prod = isProd(model);
   const color = prod ? "#2563eb" : data.done && !onGpu(data.processor) ? "#c0504d" : "#94a3b8";
   const pct = maxTps ? Math.max((data.tokens_per_sec / maxTps) * 100, 2) : 2;
   return (
@@ -175,6 +184,7 @@ function CompareRow({
       {data.done && (
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-500">
           <span>TTFT {fmt(Math.round(data.ttft_ms ?? 0))} ms</span>
+          <span>total {fmt(Math.round(data.total_time_ms ?? 0))} ms</span>
           <span>VRAM {fmt(data.peak_vram_mb)} MB</span>
           <span className={onGpu(data.processor) ? "text-slate-500" : "text-red-500"}>
             {data.processor}
@@ -257,6 +267,23 @@ export default function EvalPage() {
   const [ctxCurrent, setCtxCurrent] = useState<number | null>(null);
 
   const textBoxRef = useRef<HTMLDivElement>(null);
+  // The in-flight request/loop, so a Stop click can cut in without clearing
+  // whatever results (results/compare/ctx) are already on screen.
+  const abortRef = useRef<AbortController | null>(null);
+
+  function stopCurrent() {
+    abortRef.current?.abort();
+  }
+
+  // The production RAG model — reported live by the backend (RAG_MODEL env
+  // var), not hard-coded here, so this page can't drift out of sync with
+  // whatever the backend is actually configured to serve.
+  const isProd = (name: string) => name === info?.production_model;
+  const prodModel = info?.models.find((m) => m.name === info.production_model);
+  const vramGb =
+    info && info.hardware.vram_mb > 0
+      ? (info.hardware.vram_mb / 1024).toFixed(0)
+      : null;
 
   useEffect(() => {
     fetch("/api/benchmark/info")
@@ -264,7 +291,7 @@ export default function EvalPage() {
       .then((data: Info) => {
         setInfo(data);
         const def =
-          data.models.find((m) => isProd(m.name))?.name ??
+          data.models.find((m) => m.name === data.production_model)?.name ??
           data.models[0]?.name ??
           "";
         setModel(def);
@@ -282,6 +309,8 @@ export default function EvalPage() {
 
   async function run() {
     if (!model || !query || busy) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setRunning(true);
     setLive(EMPTY);
     setText("");
@@ -302,9 +331,12 @@ export default function EvalPage() {
           setResults((prev) => [{ ...acc, model, query }, ...prev]);
         } else if (e.type === "error") setError(e.message as string);
         setLive({ ...acc });
-      });
+      }, controller.signal);
     } catch {
-      setError("Stream failed — is the backend still running?");
+      // A Stop click aborts intentionally — that's not a failure to report.
+      if (!controller.signal.aborted) {
+        setError("Stream failed — is the backend still running?");
+      }
     } finally {
       setRunning(false);
     }
@@ -312,6 +344,8 @@ export default function EvalPage() {
 
   async function compareAll() {
     if (!info || !query || busy) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setError("");
     // Seed every model with an empty row so the chart shows them all up front.
     const seeded: Record<string, Live> = {};
@@ -319,6 +353,7 @@ export default function EvalPage() {
     setCompare(seeded);
 
     for (const m of info.models) {
+      if (controller.signal.aborted) break;
       setCompareCurrent(m.name);
       const acc: Live = { ...EMPTY };
       try {
@@ -332,8 +367,11 @@ export default function EvalPage() {
             Object.assign(acc, e, { done: true });
           }
           setCompare((prev) => ({ ...prev, [m.name]: { ...acc } }));
-        });
+        }, controller.signal);
       } catch {
+        // Stop was clicked — leave this model's partial row as-is, don't
+        // report it as a failure, and don't start the next one.
+        if (controller.signal.aborted) break;
         setError(`Run failed for ${m.name}.`);
       }
     }
@@ -342,6 +380,8 @@ export default function EvalPage() {
 
   async function runContextSweep() {
     if (!ctxModel || !query || busy) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setError("");
     // Seed all N up front so the chart shows the axis before anything runs.
     const seeded: Record<number, CtxPoint> = {};
@@ -352,16 +392,21 @@ export default function EvalPage() {
     setCtx(seeded);
 
     for (const n of CTX_N) {
+      if (controller.signal.aborted) break;
       setCtxCurrent(n);
       try {
         const res = await fetch("/api/benchmark/context", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ model: ctxModel, query, n_results: n }),
+          signal: controller.signal,
         });
         const d = (await res.json()) as CtxPoint;
         setCtx((prev) => ({ ...prev, [n]: { ...d, done: true } }));
       } catch {
+        // Stop was clicked — leave N's row seeded-but-not-done, don't report
+        // it as a failure, and don't start the next N.
+        if (controller.signal.aborted) break;
         setError(`Context run failed at N=${n}.`);
       }
     }
@@ -382,8 +427,8 @@ export default function EvalPage() {
     : [];
 
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="sticky top-0 z-10 flex h-12 items-center gap-3 border-b border-white/[0.06] bg-navy px-4">
+    <div className="flex h-screen flex-col bg-slate-50">
+      <header className="flex h-12 flex-shrink-0 items-center gap-3 border-b border-white/[0.06] bg-navy px-4">
         <Link
           href="/"
           className="flex items-center gap-1.5 text-sm text-slate-300 transition-colors hover:text-white"
@@ -400,6 +445,7 @@ export default function EvalPage() {
         </div>
       </header>
 
+      <div className="flex-1 overflow-y-auto">
       <main className="mx-auto max-w-4xl px-5 py-10">
         <div className="space-y-3">
           {info && (
@@ -414,8 +460,12 @@ export default function EvalPage() {
           </h1>
           <p className="max-w-2xl text-slate-600">
             This RAG runs on{" "}
-            <span className="font-medium text-slate-900">{PRODUCTION_MODEL}</span> — an
-            8B model on a 4&nbsp;GB GPU. Pick a query and run it live, or compare every
+            <span className="font-medium text-slate-900">
+              {info?.production_model ?? "…"}
+            </span>
+            {prodModel?.parameter_size && ` — ${prodModel.parameter_size} parameters`}
+            {vramGb && `, on a ${vramGb} GB GPU`}
+            . Pick a query and run it live, or compare every
             installed model on the same query. The numbers stream straight from the
             local LLM through the production retrieval path.
           </p>
@@ -427,7 +477,7 @@ export default function EvalPage() {
               <p className="font-medium">Backend offline</p>
               <p>Start the FastAPI server so this page has something to benchmark:</p>
               <pre className="mt-1 overflow-x-auto rounded-lg bg-amber-900/90 px-3 py-2 font-mono text-xs text-amber-50">
-                bash scripts/serve.sh
+                bash scripts/dev.sh
               </pre>
             </CardContent>
           </Card>
@@ -518,11 +568,23 @@ export default function EvalPage() {
                       ? `Comparing ${compareCurrent}…`
                       : `Compare all ${info ? `(${info.models.length} models)` : ""}`}
                   </Button>
+                  {(running || compareCurrent) && (
+                    <Button
+                      onClick={stopCurrent}
+                      variant="destructive"
+                      size="icon"
+                      title="Stop — keeps whatever's already finished"
+                    >
+                      <Square className="h-3.5 w-3.5 fill-current" />
+                    </Button>
+                  )}
                 </div>
                 {compareCurrent && (
                   <p className="text-xs text-slate-500">
-                    Models run one at a time — only one fits in 4&nbsp;GB at once. This
-                    takes a couple of minutes; the 8B spills to CPU and is slow.
+                    Models run one at a time —{" "}
+                    {vramGb ? `only one fits in ${vramGb} GB at once` : "only one fits in VRAM at once"}
+                    . This takes a couple of minutes
+                    {prodModel?.parameter_size && `; the ${prodModel.parameter_size} spills to CPU and is slow`}.
                   </p>
                 )}
               </CardContent>
@@ -535,8 +597,10 @@ export default function EvalPage() {
                   Same query, every model
                 </h3>
                 <p className="mt-1 text-sm text-slate-500">
-                  Generation speed on a 4&nbsp;GB GPU. Your production model is the 8B —
-                  slower because it can&apos;t fully fit in VRAM, but chosen for answer
+                  Generation speed{vramGb && ` on a ${vramGb} GB GPU`}. Your
+                  production model is{" "}
+                  {prodModel?.parameter_size ? `the ${prodModel.parameter_size}` : "this one"}{" "}
+                  — slower because it can&apos;t fully fit in VRAM, but chosen for answer
                   quality over raw speed.
                 </p>
                 <div className="mt-3 space-y-2">
@@ -547,6 +611,7 @@ export default function EvalPage() {
                       data={compare[m] ?? EMPTY}
                       maxTps={maxTps}
                       active={compareCurrent === m}
+                      prod={isProd(m)}
                     />
                   ))}
                 </div>
@@ -623,6 +688,7 @@ export default function EvalPage() {
                         <th className="px-4 py-2.5 font-medium">Model</th>
                         <th className="px-4 py-2.5 font-medium">tok/s</th>
                         <th className="px-4 py-2.5 font-medium">TTFT</th>
+                        <th className="px-4 py-2.5 font-medium">total</th>
                         <th className="px-4 py-2.5 font-medium">VRAM</th>
                         <th className="px-4 py-2.5 font-medium">Split</th>
                       </tr>
@@ -648,6 +714,9 @@ export default function EvalPage() {
                           </td>
                           <td className="px-4 py-2.5 tabular-nums">
                             {fmt(Math.round(r.ttft_ms ?? 0))} ms
+                          </td>
+                          <td className="px-4 py-2.5 tabular-nums">
+                            {fmt(Math.round(r.total_time_ms ?? 0))} ms
                           </td>
                           <td className="px-4 py-2.5 tabular-nums">
                             {fmt(r.peak_vram_mb)} MB
@@ -714,7 +783,7 @@ export default function EvalPage() {
                       placeholder="…or type your own query (overrides the dropdown)"
                       className="h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none focus:border-blue-500 disabled:opacity-50"
                     />
-                    <div className="flex justify-center">
+                    <div className="flex justify-center gap-2">
                       <Button onClick={runContextSweep} disabled={busy || !info} className="gap-1.5">
                         {ctxCurrent ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
@@ -723,11 +792,22 @@ export default function EvalPage() {
                         )}
                         {ctxCurrent ? `Running N=${ctxCurrent}…` : "Run sweep (N = 3…50)"}
                       </Button>
+                      {ctxCurrent !== null && (
+                        <Button
+                          onClick={stopCurrent}
+                          variant="destructive"
+                          size="icon"
+                          title="Stop — keeps whatever's already finished"
+                        >
+                          <Square className="h-3.5 w-3.5 fill-current" />
+                        </Button>
+                      )}
                     </div>
                     <p className="text-center text-xs text-slate-500">
                       Same query, more retrieved speeches → longer prompt. Measures how
-                      prefill (TTFT) scales with context. The production 8B spills to CPU,
-                      so its sweep is slow — pick a smaller model above for a quick run.
+                      prefill (TTFT) scales with context. The production{" "}
+                      {prodModel?.parameter_size ?? "model"} spills to CPU, so its sweep is
+                      slow — pick a smaller model above for a quick run.
                     </p>
                   </CardContent>
                 </Card>
@@ -768,6 +848,7 @@ export default function EvalPage() {
           </>
         )}
       </main>
+      </div>
     </div>
   );
 }

@@ -7,10 +7,23 @@
 FROM python:3.12-slim
 
 # build-essential covers the few deps without prebuilt wheels (e.g. parts of the
-# chromadb / sentence-transformers stack).
+# chromadb / sentence-transformers stack). curl + zstd are needed below to
+# fetch and unpack the Ollama CLI release (.tar.zst).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential curl zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# Ollama CLI — client only. The container never runs `ollama serve`; this lets
+# processor_split() in bench.py run `ollama ps` against the REMOTE Ollama
+# (OLLAMA_BASE_URL) to show the real GPU/CPU layer split on /eval, instead of
+# it falling back to "unknown" with nothing installed to ask. Installed from
+# the raw release archive, not the official install.sh — that script also
+# sets up a systemd service and probes for a local GPU, neither of which
+# applies here. Releases ship as .tar.zst (not the older .tgz).
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://ollama.com/download/ollama-linux-${ARCH}.tar.zst" -o /tmp/ollama.tar.zst \
+    && tar --zstd -C /usr -xf /tmp/ollama.tar.zst \
+    && rm /tmp/ollama.tar.zst
 
 WORKDIR /app
 

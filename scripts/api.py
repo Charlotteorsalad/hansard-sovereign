@@ -179,6 +179,7 @@ def benchmark_info():
         "hardware": gpu_info(),
         "models": list_models(),
         "queries": BENCHMARK_QUERIES,
+        "production_model": DEFAULT_MODEL,
     }
 
 
