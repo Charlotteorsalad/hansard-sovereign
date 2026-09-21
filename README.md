@@ -10,24 +10,45 @@ and link back to the originating speech with `[n]` citations. Both English and
 Bahasa Malaysia questions are supported.
 
 ## Demo
-### Chat(Llama 8B) - English
+### Chat interfaces
+#### Chat(Llama 8B) - English
 <img width="1904" height="962" alt="image" src="https://github.com/user-attachments/assets/fa98a119-237d-401b-bd71-8f75bf968058" />
 
-### Chat(Llama 8B) - Malay
+#### Chat(Llama 8B) - Malay
 <img width="1904" height="899" alt="image" src="https://github.com/user-attachments/assets/a0b4faf3-6faa-4bc6-bb30-fe9646ab4e12" />
 
-### Chat(Fine-tuned 1.5B)
+#### Chat(Fine-tuned 1.5B)
 <img width="1914" height="901" alt="image" src="https://github.com/user-attachments/assets/b9a55e88-d116-49a1-b950-b2bbc955bd9c" />
 
-### Compare both Llama 8B and Fine-tuned 1.5B
+#### Compare both Llama 8B and Fine-tuned 1.5B
 <img width="1910" height="900" alt="image" src="https://github.com/user-attachments/assets/4920dfbe-7f99-49c5-981a-82b5d619795b" />
 <img width="1899" height="898" alt="image" src="https://github.com/user-attachments/assets/7c30f349-b5b0-4c3d-83a6-e4b916f7d781" />
 
+### Live inference benchmark Interface
+#### Model comparison UI
+<img width="1909" height="901" alt="image" src="https://github.com/user-attachments/assets/a345dcd9-499b-4123-a042-166b0de67a65" />
+
+#### Context length UI
+<img width="1902" height="904" alt="image" src="https://github.com/user-attachments/assets/4a629419-bee2-40ad-abe0-4bdf0db8cbe3" />
+
+## Benchmarks
 ### Live inference benchmark - Model comparison
-to be update
+<img width="1910" height="906" alt="image" src="https://github.com/user-attachments/assets/f39f08d5-903b-42be-8c88-0b41da7bd017" />
 
 ### Live inference benchmark - Context length
-to be update
+#### Model 1 - llama3.1:8b-instruct-q4_K_M (4,693MB) (production to show as baseline)
+<img width="1908" height="900" alt="image" src="https://github.com/user-attachments/assets/e73730bc-fda6-4353-841c-3ad52c10e8a7" />
+
+#### Model 2 - hansard-qwen:latest (940MB) (fine-tuned)
+<img width="1912" height="909" alt="image" src="https://github.com/user-attachments/assets/698e7ab6-519b-4a98-b975-1eb24937fe70" />
+
+#### Model 3 - qwen2.5:1.5b (940MB)  (Comparison model)
+<img width="1901" height="903" alt="image" src="https://github.com/user-attachments/assets/2e636cbd-8304-4414-92fe-559231226f27" />
+
+#### Model 4 - qwen2.5:7b-instruct (4,466MB) (baseline used for fine-tuning)
+<img width="1906" height="905" alt="image" src="https://github.com/user-attachments/assets/ee87f54b-ba32-4978-ad57-d37dadb90a50" />
+
+#### Context length comparison
 
 ## Features
 
