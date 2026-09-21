@@ -18,6 +18,7 @@ Bahasa Malaysia questions are supported.
   - [Live inference benchmark - Model comparison](#live-inference-benchmark---model-comparison)
   - [Live inference benchmark - Context length](#live-inference-benchmark---context-length)
 - [Features](#features)
+- [System Architecture](#system-architecture)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
 - [Cross-lingual behaviour (and an honest limitation)](#cross-lingual-behaviour-and-an-honest-limitation)
@@ -159,7 +160,10 @@ write-up (methodology, cache-hit and truncation pitfalls) in
 - **Real example questions** - starter prompts are generated from actual
   corpus facts (topics, members, sitting dates) each new chat, not hardcoded.
 - **Live inference benchmark** - an `/eval` page that streams real TTFT,
-  tokens/sec and peak VRAM straight from the local model.
+  tokens/sec, and peak VRAM straight from the local model.
+
+## System Architecture
+<img width="5034" height="6356" alt="diagram (2)" src="https://github.com/user-attachments/assets/9824c705-b546-4eff-8744-86f20041bf4a" />
 
 ## Quick start
 
