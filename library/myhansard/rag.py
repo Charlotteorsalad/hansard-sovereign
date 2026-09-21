@@ -447,13 +447,25 @@ def _build_system(lang: str) -> str:
 
 _TEMPERATURE = 0.3
 
+# num_ctx actually used in production, exported so bench.py's model-comparison
+# benchmark can import it rather than guess — a benchmark run under a
+# different num_ctx changes the KV cache size and therefore the CPU/GPU layer
+# split (bigger num_ctx = more reserved VRAM = more of the model pushed to
+# CPU), so its numbers would quietly stop representing this app's real
+# behaviour. A real production prompt (8 retrieved speeches) measured at
+# 2,244 tokens; 512 more for num_predict puts the floor at ~2,756. 4096 leaves
+# real headroom without silently truncating, while staying well short of the
+# context-length sweep's 12,288 (that one deliberately stress-tests up to 50
+# speeches — production never retrieves anywhere near that many).
+PRODUCTION_NUM_CTX = 4096
+
 
 def _options() -> dict:
     # num_predict bounds the answer: the summaries are short lists, and it stops
     # a model that doesn't emit EOS cleanly (e.g. the small fine-tune) from
     # generating to the context limit.
     return {"temperature": _TEMPERATURE, "seed": random.randint(0, 99999),
-            "num_predict": 512}
+            "num_predict": 512, "num_ctx": PRODUCTION_NUM_CTX}
 
 
 def _sources_payload(speeches: list) -> list:

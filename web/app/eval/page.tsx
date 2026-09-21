@@ -38,6 +38,11 @@ type Info = {
 
 type Live = {
   ttft_ms: number | null;
+  // load_ms/prefill_ms decompose ttft_ms (Ollama's own load_duration and
+  // prompt_eval_duration) so a cold model load isn't mistaken for slow
+  // prefill — on a cold run load_ms can be most of ttft_ms.
+  load_ms: number | null;
+  prefill_ms: number | null;
   tokens: number;
   tokens_per_sec: number;
   peak_vram_mb: number;
@@ -62,6 +67,8 @@ const CTX_N = [3, 5, 10, 20, 30, 50];
 
 const EMPTY: Live = {
   ttft_ms: null,
+  load_ms: null,
+  prefill_ms: null,
   tokens: 0,
   tokens_per_sec: 0,
   peak_vram_mb: 0,
@@ -183,7 +190,24 @@ function CompareRow({
       </div>
       {data.done && (
         <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-500">
-          <span>TTFT {fmt(Math.round(data.ttft_ms ?? 0))} ms</span>
+          <span>
+            {/* Production keeps models resident, so a cold model load isn't
+                what a real user experiences — lead with TTFT minus that load
+                (what prefill alone costs), and note the load separately
+                rather than silently folding it into the headline number. */}
+            TTFT{" "}
+            {fmt(
+              Math.round(
+                (data.ttft_ms ?? 0) - (data.load_ms && data.load_ms > 200 ? data.load_ms : 0)
+              )
+            )}{" "}
+            ms
+            {data.load_ms != null && data.load_ms > 200 && (
+              <span className="text-amber-600">
+                {" "}(+{fmt(Math.round(data.load_ms))} ms this run — cold model load)
+              </span>
+            )}
+          </span>
           <span>total {fmt(Math.round(data.total_time_ms ?? 0))} ms</span>
           <span>VRAM {fmt(data.peak_vram_mb)} MB</span>
           <span className={onGpu(data.processor) ? "text-slate-500" : "text-red-500"}>
@@ -265,6 +289,10 @@ export default function EvalPage() {
   const [ctxModel, setCtxModel] = useState("");
   const [ctx, setCtx] = useState<Record<number, CtxPoint>>({});
   const [ctxCurrent, setCtxCurrent] = useState<number | null>(null);
+  // True only during the pre-sweep warmup call, which can take several
+  // seconds (a num_ctx switch forces a model reload) — ctxCurrent alone
+  // can't show it, since it's only set once the real N points start.
+  const [ctxWarming, setCtxWarming] = useState(false);
 
   const textBoxRef = useRef<HTMLDivElement>(null);
   // The in-flight request/loop, so a Stop click can cut in without clearing
@@ -295,7 +323,15 @@ export default function EvalPage() {
           data.models[0]?.name ??
           "";
         setModel(def);
-        setCtxModel(def); // focus on the production model in both tabs
+        // The context sweep's whole point is isolating how prefill scales
+        // with attention, not with CPU-offload noise — that only holds for
+        // whichever model stays fully GPU-resident (see
+        // docs/context_length_benchmark.md). The smallest installed model is
+        // this project's stand-in for that; defaulting this tab to
+        // production instead would drown the signal in CPU spill and make
+        // long-N points slow without showing the effect they're there for.
+        const smallest = [...data.models].sort((a, b) => a.size_mb - b.size_mb)[0]?.name ?? def;
+        setCtxModel(smallest);
         setPresetQuery(data.queries[0] ?? "");
       })
       .catch(() => setOffline(true));
@@ -305,7 +341,7 @@ export default function EvalPage() {
     textBoxRef.current?.scrollTo({ top: textBoxRef.current.scrollHeight });
   }, [text]);
 
-  const busy = running || compareCurrent !== null || ctxCurrent !== null;
+  const busy = running || compareCurrent !== null || ctxCurrent !== null || ctxWarming;
 
   async function run() {
     if (!model || !query || busy) return;
@@ -391,6 +427,34 @@ export default function EvalPage() {
     }
     setCtx(seeded);
 
+    // Warm up before measuring: this sweep's CONTEXT_OPTIONS uses a different
+    // num_ctx than the model-comparison tab (and than production), so if that
+    // ran more recently, Ollama has to reload/reallocate for this num_ctx —
+    // and the CPU-resident layers' weights get paged in from disk on first
+    // touch. None of that is counted in load_duration, so it silently landed
+    // inside N=3's prompt_eval_duration, making the very first point in every
+    // sweep look far slower than it really is. One throwaway call absorbs
+    // that cost before any point is actually recorded.
+    setCtxWarming(true);
+    try {
+      await fetch("/api/benchmark/context", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: ctxModel, query, n_results: CTX_N[0] }),
+        signal: controller.signal,
+      });
+    } catch {
+      if (controller.signal.aborted) {
+        setCtxWarming(false);
+        setCtxCurrent(null);
+        return;
+      }
+      // A failed warmup isn't fatal — the sweep below still runs, just with
+      // N=3 possibly carrying the cold-start cost this was meant to absorb.
+    } finally {
+      setCtxWarming(false);
+    }
+
     for (const n of CTX_N) {
       if (controller.signal.aborted) break;
       setCtxCurrent(n);
@@ -421,6 +485,49 @@ export default function EvalPage() {
   const hasCompare = Object.keys(compare).length > 0;
   const hasCtx = Object.keys(ctx).length > 0;
   const maxPrefill = Math.max(1, ...Object.values(ctx).map((d) => d.prefill_ms));
+  // Token/prefill growth ratio for the subtitle below — computed from this
+  // sweep's own smallest/largest completed points, not a fixed figure from
+  // one earlier run: it genuinely varies by model and query (a different
+  // query's retrieved speeches aren't the same length), so a hard-coded
+  // number would just be wrong most of the time.
+  // Per-token cost (ms/token), not the raw endpoint ratio: with a fixed
+  // decode-dominant FFN cost plus attention's O(n²) term only starting to
+  // matter at the long end, "tokens rose 10× but prefill only rose 9×" reads
+  // as sub-linear even though it isn't — per-token cost rising a modest ~15%
+  // says the same thing (mild super-linear uptick) without that contradiction,
+  // and without one noisy endpoint swinging a ratio of two raw totals.
+  const ctxDone = Object.values(ctx).filter((p) => p.done);
+  const ctxRatio =
+    ctxDone.length >= 2
+      ? (() => {
+          const lo = ctxDone.reduce((a, b) => (a.n_results < b.n_results ? a : b));
+          const hi = ctxDone.reduce((a, b) => (a.n_results > b.n_results ? a : b));
+          if (lo.n_results === hi.n_results || lo.prompt_tokens === 0 || hi.prompt_tokens === 0) {
+            return null;
+          }
+          const loMsPerTok = lo.prefill_ms / lo.prompt_tokens;
+          const hiMsPerTok = hi.prefill_ms / hi.prompt_tokens;
+          if (loMsPerTok <= 0) return null;
+          return {
+            loMsPerTok, hiMsPerTok,
+            pct: ((hiMsPerTok - loMsPerTok) / loMsPerTok) * 100,
+            loN: lo.n_results, hiN: hi.n_results,
+          };
+        })()
+      : null;
+  // The interpretation has to follow the sign of pct, not assume it: a model
+  // spilling to CPU (pick one other than the fully GPU-resident one the
+  // docs recommend for this sweep) adds its own per-token noise that can
+  // flatten or even invert the attention-scaling signal this sweep is
+  // meant to isolate — claiming "O(n²) is showing" when per-token cost
+  // actually fell would contradict the very numbers next to it.
+  const ctxTrend = !ctxRatio
+    ? "attention's O(n²) term shows up as context grows"
+    : ctxRatio.pct >= 10
+      ? "mostly linear (the FFN term), with attention's O(n²) term visibly starting to show at the long end"
+      : ctxRatio.pct >= -2
+        ? "close to linear across this range — attention's O(n²) term isn't the dominant cost yet at these lengths"
+        : "flat to slightly improving here — no super-linear signal in this run, likely CPU-offload noise masking it (the docs use a fully GPU-resident model to isolate the attention-scaling signal cleanly)";
   // Production model (llama) first in the dropdowns — it's the focus of the page.
   const orderedModels = info
     ? [...info.models].sort((a, b) => Number(isProd(b.name)) - Number(isProd(a.name)))
@@ -631,7 +738,18 @@ export default function EvalPage() {
                   <StatTile
                     icon={<Timer className="h-3.5 w-3.5" />}
                     label="time to first token"
-                    value={live.ttft_ms != null ? fmt(Math.round(live.ttft_ms)) : "—"}
+                    // Minus any cold model-load time — production keeps
+                    // models resident, so that's not what prefill costs.
+                    value={
+                      live.ttft_ms != null
+                        ? fmt(
+                            Math.round(
+                              live.ttft_ms -
+                                (live.load_ms && live.load_ms > 200 ? live.load_ms : 0)
+                            )
+                          )
+                        : "—"
+                    }
                     unit="ms"
                   />
                   <StatTile
@@ -646,11 +764,20 @@ export default function EvalPage() {
                     unit="MB"
                   />
                 </div>
-                {live.processor && (
-                  <div className="mt-3">
-                    <Badge variant={onGpu(live.processor) ? "default" : "destructive"}>
-                      layer split: {live.processor}
-                    </Badge>
+                {(live.processor || (live.load_ms != null && live.load_ms > 200)) && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {live.processor && (
+                      <Badge variant={onGpu(live.processor) ? "default" : "destructive"}>
+                        layer split: {live.processor}
+                      </Badge>
+                    )}
+                    {live.load_ms != null && live.load_ms > 200 && (
+                      <span className="text-xs text-amber-600">
+                        this run also spent {fmt(Math.round(live.load_ms))} ms loading the
+                        model (cold) — already excluded from TTFT above; production keeps
+                        models resident so this cost isn&apos;t paid per-request
+                      </span>
+                    )}
                   </div>
                 )}
                 <div
@@ -713,7 +840,22 @@ export default function EvalPage() {
                             {r.tokens_per_sec.toFixed(1)}
                           </td>
                           <td className="px-4 py-2.5 tabular-nums">
-                            {fmt(Math.round(r.ttft_ms ?? 0))} ms
+                            {/* Load-adjusted, same convention as the live tiles above —
+                                a cold run's TTFT here would otherwise look erratic. */}
+                            {fmt(
+                              Math.round(
+                                (r.ttft_ms ?? 0) - (r.load_ms && r.load_ms > 200 ? r.load_ms : 0)
+                              )
+                            )}{" "}
+                            ms
+                            {r.load_ms != null && r.load_ms > 200 && (
+                              <span
+                                className="text-amber-600"
+                                title={`Cold run — ${fmt(Math.round(r.load_ms))} ms of model loading already excluded above`}
+                              >
+                                {" "}*
+                              </span>
+                            )}
                           </td>
                           <td className="px-4 py-2.5 tabular-nums">
                             {fmt(Math.round(r.total_time_ms ?? 0))} ms
@@ -745,7 +887,9 @@ export default function EvalPage() {
                   <CardContent className="space-y-4 py-5">
                     <div className="grid gap-4 sm:grid-cols-2">
                       <label className="flex flex-col gap-1.5 text-sm">
-                        <span className="text-slate-500">Model</span>
+                        <span className="text-slate-500">
+                          Model (defaults to smallest — stays fully in VRAM, for a clean signal)
+                        </span>
                         <select
                           value={ctxModel}
                           onChange={(e) => setCtxModel(e.target.value)}
@@ -785,14 +929,18 @@ export default function EvalPage() {
                     />
                     <div className="flex justify-center gap-2">
                       <Button onClick={runContextSweep} disabled={busy || !info} className="gap-1.5">
-                        {ctxCurrent ? (
+                        {ctxWarming || ctxCurrent ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
                         ) : (
                           <Layers className="h-4 w-4" />
                         )}
-                        {ctxCurrent ? `Running N=${ctxCurrent}…` : "Run sweep (N = 3…50)"}
+                        {ctxWarming
+                          ? "Warming up model…"
+                          : ctxCurrent
+                            ? `Running N=${ctxCurrent}…`
+                            : "Run sweep (N = 3…50)"}
                       </Button>
-                      {ctxCurrent !== null && (
+                      {(ctxWarming || ctxCurrent !== null) && (
                         <Button
                           onClick={stopCurrent}
                           variant="destructive"
@@ -803,6 +951,12 @@ export default function EvalPage() {
                         </Button>
                       )}
                     </div>
+                    {ctxWarming && (
+                      <p className="text-center text-xs text-amber-600">
+                        Loading the model at this sweep&apos;s context size — a cold switch can
+                        take several seconds. This isn&apos;t stuck.
+                      </p>
+                    )}
                     <p className="text-center text-xs text-slate-500">
                       Same query, more retrieved speeches → longer prompt. Measures how
                       prefill (TTFT) scales with context. The production{" "}
@@ -818,8 +972,18 @@ export default function EvalPage() {
                       Prefill latency vs context length
                     </h3>
                     <p className="mt-1 text-sm text-slate-500">
-                      Bar length = prefill time. It grows super-linearly with prompt
-                      length as attention&apos;s O(n²) term kicks in.
+                      Bar length = prefill time.{" "}
+                      {ctxRatio ? (
+                        <>
+                          Per-token prefill cost goes from {ctxRatio.loMsPerTok.toFixed(1)} to{" "}
+                          {ctxRatio.hiMsPerTok.toFixed(1)} ms (N={ctxRatio.loN}→{ctxRatio.hiN},{" "}
+                          {ctxRatio.pct >= 0 ? "+" : ""}
+                          {ctxRatio.pct.toFixed(0)}%)
+                        </>
+                      ) : (
+                        "Per-token prefill cost creeps up as context grows"
+                      )}{" "}
+                      — {ctxTrend}.
                     </p>
                     <div className="mt-3 space-y-2">
                       {CTX_N.map((n) => (

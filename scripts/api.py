@@ -1,7 +1,10 @@
+import asyncio
 import json
+import queue
 import random
 import re
 import sqlite3
+import threading
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -185,12 +188,54 @@ def benchmark_info():
 
 @app.post("/benchmark/run")
 def benchmark_run(request: BenchmarkRequest):
-    def generate():
+    """Streamed live-benchmark run (SSE) for one model/query.
+
+    live_benchmark() is a synchronous generator doing blocking I/O against
+    Ollama, so it runs in a background thread; this async generator relays
+    each event to the client. Manually polling Request.is_disconnected() here
+    turned out to be unreliable (verified live: it never fired), likely
+    fighting Starlette's own disconnect-watcher for the same ASGI receive
+    channel. Relying on that built-in mechanism instead — it cancels this
+    generator once it detects the client is gone — and catching that in
+    `finally` to set cancel_event is what actually and reliably worked in
+    testing. Without this, a Stop click (or the client simply giving up) left
+    the backend still waiting on Ollama regardless — burning the one
+    generation slot this 4 GB GPU has until that request finished or hit its
+    own 600s timeout, and wedging every request after it behind it.
+    """
+    events: queue.Queue = queue.Queue()
+    cancel_event = threading.Event()
+    _sentinel = object()
+
+    def worker():
         try:
-            for event in live_benchmark(request.model, request.query, collection, conn):
-                yield f"data: {json.dumps(event)}\n\n"
+            for event in live_benchmark(
+                request.model, request.query, collection, conn, cancel_event
+            ):
+                events.put(event)
         except Exception as exc:  # surface Ollama / model errors to the UI
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+            events.put({"type": "error", "message": str(exc)})
+        finally:
+            events.put(_sentinel)
+
+    async def generate():
+        threading.Thread(target=worker, daemon=True).start()
+        try:
+            while True:
+                try:
+                    item = await asyncio.to_thread(events.get, True, 0.25)
+                except queue.Empty:
+                    continue
+                if item is _sentinel:
+                    break
+                yield f"data: {json.dumps(item)}\n\n"
+        finally:
+            # Reached on normal completion too (cancel_event.set() after the
+            # worker is already done is a harmless no-op) — and reliably
+            # reached when the client disconnects, since Starlette cancels
+            # this generator via GeneratorExit/CancelledError at whichever
+            # `await`/`yield` it's suspended at.
+            cancel_event.set()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -209,5 +254,49 @@ def benchmark_context_steps():
 
 @app.post("/benchmark/context")
 def benchmark_context(request: ContextRequest):
-    """One point of the context-length curve: prefill/latency for a given N."""
-    return context_run(request.model, request.query, request.n_results, collection, conn)
+    """One point of the context-length curve: prefill/latency for a given N.
+
+    Implemented as a StreamingResponse yielding periodic keep-alive chunks
+    and a single final JSON chunk — not because the response is actually
+    streamed (the client still just calls .json() on it once), but because
+    that's the pattern Starlette reliably detects client disconnection for.
+    Polling Request.is_disconnected() on a plain response here was tried
+    first and, verified live, never actually fired — this endpoint was the
+    one that got stuck and needed a manual Ollama restart. The same logic
+    wrapped in an async generator inside a StreamingResponse (as
+    benchmark_run() below already does) was verified to detect disconnection
+    instantly instead. context_run() is synchronous, so it runs in a
+    background thread.
+
+    Note: even with instant detection here, a client that disconnects while
+    Ollama is mid-prefill on a long/CPU-spilled prompt won't free the GPU
+    slot until that prefill batch finishes — llama.cpp only checks for a
+    closed connection between generation steps, not mid-batch. That's a
+    limit of the inference engine, not of this cancellation path (verified
+    live with debug timestamps: cancel_event fires and closes our connection
+    to Ollama the instant the client disconnects).
+    """
+    cancel_event = threading.Event()
+    result: dict = {}
+
+    def worker():
+        try:
+            result["data"] = context_run(
+                request.model, request.query, request.n_results,
+                collection, conn, cancel_event,
+            )
+        except Exception as exc:  # surface Ollama / model errors to the UI
+            result["error"] = str(exc)
+
+    async def generate():
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            while thread.is_alive():
+                await asyncio.sleep(0.1)
+                yield " "
+            yield json.dumps(result.get("data") or {"error": result.get("error")})
+        finally:
+            cancel_event.set()
+
+    return StreamingResponse(generate(), media_type="application/json")

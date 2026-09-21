@@ -78,7 +78,7 @@ def run_once(prompt: str, system: str, nonce: str) -> dict:
     start = time.perf_counter()
     ttft = None
     done = {}
-    with VramSampler() as vram:
+    with VramSampler(MODEL) as vram:
         with requests.post(
             OLLAMA_GENERATE,
             json={"model": MODEL, "system": system, "prompt": busted,
